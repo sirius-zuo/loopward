@@ -21,6 +21,10 @@ Loopward is an independent loop engineering framework for durable, context-effic
 11. [MVP and Evaluation](10-mvp-and-evaluation.md)
 12. [Risks and Open Questions](11-risks-and-open-questions.md)
 
+## Implementation Plans
+
+- [Phase One Implementation Plan](superpowers/plans/2026-07-29-loopward-phase-one.md)
+
 ## Normative Language
 
 The terms **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** are normative. “Phase One” refers to the first implementation milestone described in the MVP document.
