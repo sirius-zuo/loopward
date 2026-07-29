@@ -1,0 +1,76 @@
+schema_version: loopward.checkpoint/v0.1
+
+identity:
+  loop_id: loop-001
+  checkpoint_id: checkpoint-0001
+  checkpoint_version: 1
+  aggregate_revision: 7
+  parent_checkpoint_id: null
+  created_at: "2026-07-29T00:00:00Z"
+
+kernel:
+  status: active
+  phase: implementation
+  active_episode_id: episode-003
+  active_session_generation: 3
+  active_work_unit_id: work-unit-017
+
+goal:
+  statement: "Complete the durable task."
+  success_criteria:
+    - id: criterion-001
+      statement: "All required verification gates pass."
+      status: pending
+
+pinned:
+  digest: "sha256:..."
+  constraints:
+    - id: constraint-001
+      statement: "Preserve the public contract."
+      source: user
+      scope: loop
+  policies: []
+
+work:
+  completed: []
+  active:
+    - work_unit_id: work-unit-017
+  pending: []
+  blocked: []
+
+decisions:
+  active: []
+  superseded: []
+
+observations:
+  verified: []
+  unverified: []
+  disproven: []
+
+domain:
+  schema: loopward.domain.example/v0.1
+  state: {}
+
+resources:
+  relevant: []
+  archived: []
+
+verification:
+  status: pending
+  findings: []
+
+continuation:
+  next_action:
+    type: execute_work_unit
+    work_unit_id: work-unit-017
+  rotation_recommended: false
+
+telemetry:
+  known: {}
+  estimated: {}
+  unavailable: []
+
+integrity:
+  checkpoint_digest: "sha256:..."
+  unresolved_mutations: []
+

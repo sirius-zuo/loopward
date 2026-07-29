@@ -1,0 +1,26 @@
+schema_version: loopward.work-unit-result/v0.1
+
+attempt_id: attempt-017-1
+outcome: produced
+
+outputs:
+  - uri: resource://output/017
+    digest: "sha256:..."
+
+state_proposals: []
+observation_proposals: []
+decision_proposals: []
+verification_evidence: []
+unresolved: []
+
+recommended_continuation:
+  type: verify
+
+usage:
+  known: {}
+  estimated: {}
+  unavailable:
+    - input_tokens
+
+runner_trace_refs: []
+

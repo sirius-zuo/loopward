@@ -1,0 +1,38 @@
+schema_version: loopward.work-unit/v0.1
+
+id: work-unit-017
+kind: domain.example
+objective: "Produce one externally observable unit of progress."
+status: pending
+
+inputs:
+  - uri: resource://input/001
+    digest: "sha256:..."
+
+constraints:
+  - ref: constraint://constraint-001
+
+output_contract:
+  schema: loopward.work-unit-result/v0.1
+
+verification_plan:
+  ref: verification-plan://plan-017
+  version: 1
+
+runner:
+  name: command
+  profile: default
+
+budget:
+  context:
+    soft_input_limit_tokens: 24000
+    hard_input_limit_tokens: 48000
+  attempts:
+    maximum: 2
+
+retry_policy:
+  retryable_codes:
+    - unavailable
+    - timeout
+  require_reconciliation_before_retry: true
+

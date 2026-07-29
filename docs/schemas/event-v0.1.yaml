@@ -1,0 +1,26 @@
+schema_version: loopward.event/v0.1
+
+event_id: event-000001
+journal_position: 1
+loop_id: loop-001
+aggregate_revision: 7
+occurred_at: "2026-07-29T00:00:00Z"
+recorded_at: "2026-07-29T00:00:01Z"
+
+type: checkpoint.committed
+durability: durable
+
+correlation:
+  episode_id: episode-003
+  session_id: session-003
+  work_unit_id: work-unit-017
+  attempt_id: attempt-017-1
+  trace_id: null
+
+payload:
+  checkpoint_ref: checkpoint://loop-001/1
+  checkpoint_version: 1
+
+integrity:
+  payload_digest: "sha256:..."
+
