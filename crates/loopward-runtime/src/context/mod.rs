@@ -34,8 +34,11 @@
 //! `decisions.active`, `observations.verified`, `work`, `resources`) — and
 //! performs exactly two derivations of its own:
 //!
-//! * every [`WorkUnit`] input not already covered by a candidate is
-//!   projected into a required current-work candidate; and
+//! * every [`WorkUnit`] input is guaranteed to be required context — an
+//!   uncovered input is projected into a required current-work candidate,
+//!   and an input the projection covered at a lower priority has that
+//!   candidate promoted to [`ContextPriority::Required`], so a declared
+//!   input can never be dropped for budget reasons; and
 //! * every [`WorkUnit`] constraint must be covered by a required pinned
 //!   candidate, or hydration fails.
 //!
@@ -80,9 +83,9 @@ pub use manifest::{BOOT_PACKAGE_MANIFEST_SCHEMA_VERSION, checkpoint_ref_for};
 /// content digest, and the final fidelity and token estimate).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContextCandidate {
-    /// A stable, manifest-scoped identifier. Ties within a selection bucket
-    /// are broken by lexicographic order on this field, so it must be unique
-    /// within one request.
+    /// A stable, manifest-scoped identifier. Candidates sharing a selection
+    /// bucket *and* a [`ContextPriority`] are ordered lexicographically on
+    /// this field, so it must be unique within one request.
     pub id: String,
     /// The kind of underlying material (e.g. `constraint`, `decision`).
     pub kind: String,

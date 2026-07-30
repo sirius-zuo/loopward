@@ -573,6 +573,70 @@ async fn supplemental_items_are_omitted_before_important_items() {
     );
 }
 
+/// `Important` material whose class has no dedicated bucket (an unverified
+/// observation) shares [`SelectionBucket::Supplemental`] with genuinely
+/// supplemental material. Declared priority must still decide inside that
+/// bucket, even when the supplemental item sorts earlier by identifier.
+#[tokio::test]
+async fn important_material_outranks_supplemental_inside_a_shared_bucket() {
+    let broker = Arc::new(RecordingBroker::new());
+    let mut unverified = candidate(
+        "zzz-important-unverified",
+        "resource://evidence/unverified-001",
+        ContextClass::Evidence,
+        ContextPriority::Important,
+        Some(700),
+    );
+    unverified.verification_status = Some(VerificationStatus::Unverified);
+    let candidates = vec![
+        candidate(
+            "pin-001",
+            "constraint://policy-001",
+            ContextClass::Pinned,
+            ContextPriority::Required,
+            Some(200),
+        ),
+        candidate(
+            "aaa-supplemental",
+            "resource://history/001",
+            ContextClass::Evidence,
+            ContextPriority::Supplemental,
+            Some(700),
+        ),
+        unverified,
+    ];
+    let report = hydrate(
+        Arc::clone(&broker),
+        request(
+            work_unit(&["constraint://policy-001"], &[]),
+            budget(4_000, 1_500, 1_000, 500),
+            candidates,
+            true,
+        ),
+    )
+    .await
+    .expect("hydration succeeds within budget");
+
+    assert_eq!(
+        report.bucket("aaa-supplemental"),
+        Some(SelectionBucket::Supplemental)
+    );
+    assert_eq!(
+        report.bucket("zzz-important-unverified"),
+        Some(SelectionBucket::Supplemental),
+        "the shared-bucket path is the one under test"
+    );
+    assert_eq!(
+        report.disposition("zzz-important-unverified"),
+        Some(&CandidateDisposition::Included),
+        "important material is offered budget before supplemental material"
+    );
+    assert_eq!(
+        report.exclusion_reason("aaa-supplemental"),
+        Some(ExclusionReason::BudgetExhausted)
+    );
+}
+
 #[tokio::test]
 async fn on_demand_references_cost_a_bounded_reference_fee_when_the_runner_can_fetch() {
     let broker = Arc::new(RecordingBroker::new());
@@ -661,6 +725,76 @@ async fn work_unit_inputs_without_candidates_are_hydrated_as_required_current_wo
     assert_eq!(input.priority, ContextPriority::Required);
     assert_eq!(input.classification, ContextClass::CurrentWork);
     assert_eq!(input.estimate_method, Some(EstimateMethod::Heuristic));
+}
+
+/// A projection that *downgrades* a declared Work Unit input defeats the
+/// synthesis guard just as thoroughly as one that omits it: the input must
+/// never be droppable for budget reasons.
+#[tokio::test]
+async fn a_work_unit_input_covered_by_a_lower_priority_candidate_is_promoted() {
+    let broker = Arc::new(RecordingBroker::new());
+    let candidates = vec![
+        candidate(
+            "pin-001",
+            "constraint://policy-001",
+            ContextClass::Pinned,
+            ContextPriority::Required,
+            Some(200),
+        ),
+        // Sorts before the input candidate, and would consume the budget
+        // first if the input were left at supplemental priority.
+        candidate(
+            "aaa-filler",
+            "resource://history/001",
+            ContextClass::Evidence,
+            ContextPriority::Supplemental,
+            Some(700),
+        ),
+        candidate(
+            "zzz-declared-input",
+            "resource://work/input-001",
+            ContextClass::CurrentWork,
+            ContextPriority::Supplemental,
+            Some(700),
+        ),
+    ];
+    let report = hydrate(
+        Arc::clone(&broker),
+        request(
+            work_unit(&["constraint://policy-001"], &["resource://work/input-001"]),
+            budget(4_000, 1_500, 1_000, 500),
+            candidates,
+            true,
+        ),
+    )
+    .await
+    .expect("hydration succeeds within budget");
+
+    let input = report
+        .manifest
+        .items
+        .iter()
+        .find(|item| item.source.uri == "resource://work/input-001")
+        .expect("a declared Work Unit input survives even when projected as supplemental");
+    assert_eq!(
+        input.id, "zzz-declared-input",
+        "the covering candidate is promoted, not duplicated"
+    );
+    assert_eq!(input.priority, ContextPriority::Required);
+    assert_eq!(
+        report.bucket("zzz-declared-input"),
+        Some(SelectionBucket::RequiredCurrentWork)
+    );
+    assert!(
+        input.selection_reason.contains("promoted to required"),
+        "the promotion is recorded in the item's selection reason, saw {:?}",
+        input.selection_reason
+    );
+    assert_eq!(
+        report.exclusion_reason("aaa-filler"),
+        Some(ExclusionReason::BudgetExhausted),
+        "the required input takes budget ahead of supplemental material"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -926,7 +1060,17 @@ async fn the_hundred_thousand_token_history_yields_a_bounded_verification_manife
         selected <= available,
         "the Boot Package must fit the available boot budget"
     );
+    assert_eq!(
+        selected, 29_792,
+        "the fixture's selected size is a deterministic regression anchor"
+    );
 
+    assert_final_verification_selection(&report);
+}
+
+/// The selection properties the `docs/10-mvp-and-evaluation.md` §7 stress
+/// scenario requires of a final verification Boot Package.
+fn assert_final_verification_selection(report: &HydrationReport) {
     // Everything required, and every applicable decision, verified
     // observation, important input, and recent accepted outcome survives.
     for id in [
@@ -965,14 +1109,29 @@ async fn the_hundred_thousand_token_history_yields_a_bounded_verification_manife
     }
 
     // Bulk history is dropped, and superseded decisions never compete at all.
-    assert_eq!(
-        report.exclusion_reason("sup-020-history"),
-        Some(ExclusionReason::BudgetExhausted)
-    );
+    for id in ["sup-001-history", "sup-020-history"] {
+        assert_eq!(
+            report.exclusion_reason(id),
+            Some(ExclusionReason::BudgetExhausted),
+            "{id} is genuinely supplemental and must yield the remaining budget"
+        );
+    }
     assert_eq!(
         report.exclusion_reason("dsup-001-superseded"),
         Some(ExclusionReason::Superseded)
     );
+
+    // Important-priority material demoted into the supplemental bucket
+    // (unverified observations) still outranks genuinely supplemental
+    // material sharing that bucket.
+    for id in ["uev-001-unverified", "uev-002-unverified"] {
+        assert_eq!(
+            report.disposition(id),
+            Some(&CandidateDisposition::Included),
+            "{id} is important-priority and outranks every sup-* candidate"
+        );
+        assert_eq!(report.bucket(id), Some(SelectionBucket::Supplemental));
+    }
 
     // Every candidate considered is accounted for, with an estimation method.
     assert_eq!(report.considered.len(), 72);

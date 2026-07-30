@@ -9,7 +9,7 @@
 //! validate budget
 //!     -> project Work Unit inputs into candidates
 //!     -> check every Work Unit constraint has a required pinned candidate
-//!     -> rank candidates into selection buckets, ordered by (bucket, id)
+//!     -> rank candidates by (bucket, declared priority, id)
 //!     -> resolve and digest-check every required candidate  [fails here]
 //!     -> prove required content fits the boot budget        [fails here]
 //!     -> price and fit optional candidates in bucket order
@@ -44,8 +44,9 @@ use super::{
 /// The ordered selection buckets from `docs/04-context-lifecycle.md` §6.
 ///
 /// The declaration order *is* the selection order: budget is offered to
-/// buckets from the top down, and within a bucket to candidates in
-/// lexicographic `ContextItem::id` order.
+/// buckets from the top down, within a bucket to the higher declared
+/// [`ContextPriority`] first, and within one priority in lexicographic
+/// `ContextItem::id` order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SelectionBucket {
     /// Required pinned state: policy, active user constraints, acceptance
@@ -112,6 +113,12 @@ impl SelectionBucket {
     /// does not match a dedicated bucket (an unverified observation, a plain
     /// reference) falls to [`Self::Supplemental`] rather than being demoted
     /// to a reference — it still competes for remaining budget.
+    ///
+    /// That last case is why a bucket alone is not the whole selection key:
+    /// demoted `Important` material shares [`Self::Supplemental`] with
+    /// genuinely supplemental material, so [`priority_rank`] orders within
+    /// the bucket and keeps "important is selected before supplemental
+    /// material" (`docs/04-context-lifecycle.md` §4.2) true there too.
     fn classify(candidate: &ContextCandidate) -> Self {
         match (candidate.priority, candidate.classification) {
             (ContextPriority::Required, ContextClass::Pinned) => Self::RequiredPinned,
@@ -139,6 +146,37 @@ impl SelectionBucket {
             (ContextPriority::Supplemental | ContextPriority::Important, _) => Self::Supplemental,
         }
     }
+}
+
+/// The declared-priority order within a selection bucket.
+///
+/// `Required` outranks `Important`, which outranks `Supplemental`, which
+/// outranks `OnDemand` (`docs/04-context-lifecycle.md` §4.2). This is the
+/// second component of the selection key, so a bucket that can hold more than
+/// one declared priority — [`SelectionBucket::Supplemental`], which also
+/// receives demoted `Important` material — still offers budget to the higher
+/// priority first.
+fn priority_rank(priority: ContextPriority) -> u8 {
+    match priority {
+        ContextPriority::Required => 0,
+        ContextPriority::Important => 1,
+        ContextPriority::Supplemental => 2,
+        ContextPriority::OnDemand => 3,
+    }
+}
+
+/// The total, deterministic selection key: bucket, then declared priority,
+/// then lexicographic identifier.
+///
+/// Identifiers are unique within one request
+/// ([`HydrationError::DuplicateCandidateId`]), so this is a total order and
+/// no two candidates ever tie.
+fn selection_key(entry: &Ranked) -> (SelectionBucket, u8, &str) {
+    (
+        entry.bucket,
+        priority_rank(entry.candidate.priority),
+        entry.candidate.id.as_str(),
+    )
 }
 
 /// A candidate with its bucket assigned, ready to be ordered.
@@ -217,47 +255,68 @@ pub(crate) async fn hydrate(
         priced.push((entry, outcome));
     }
 
-    priced.sort_by(|left, right| {
-        left.0
-            .bucket
-            .cmp(&right.0.bucket)
-            .then_with(|| left.0.candidate.id.cmp(&right.0.candidate.id))
-    });
+    priced.sort_by(|left, right| selection_key(&left.0).cmp(&selection_key(&right.0)));
 
     assemble(request, priced, &pinned_bytes)
 }
 
-/// Adds a required candidate for every declared Work Unit input that the
-/// Checkpoint projection did not already cover.
+/// Guarantees every declared Work Unit input is required context.
 ///
-/// This is the minimal candidate-generation step the hydrator performs on
-/// its own: a Work Unit's declared inputs are, by definition, needed by the
-/// current Work Unit, so they are hydrated as required current work rather
-/// than silently omitted when a projection forgets them.
+/// This is the minimal candidate-generation step the hydrator performs on its
+/// own: a Work Unit's declared inputs are, by definition, needed by the
+/// current Work Unit, so they must be hydrated as required current work. Two
+/// ways a Checkpoint projection can fail to deliver that, both handled here:
+///
+/// * **The projection omitted the input.** A required current-work candidate
+///   is synthesized for it.
+/// * **The projection covered the input at a lower priority.** The covering
+///   candidate is *promoted* to [`ContextPriority::Required`]. Skipping
+///   synthesis merely because some candidate shares the URI would leave a
+///   declared input droppable by [`ExclusionReason::BudgetExhausted`], which
+///   defeats this guard exactly as thoroughly as omitting it.
+///
+/// When several candidates cover one input, the promotion applies to the
+/// lexicographically smallest identifier among them, so the outcome does not
+/// depend on the order candidates arrived in.
 fn project_candidates(request: &HydrationRequest) -> Result<Vec<ContextCandidate>, HydrationError> {
     let mut candidates = request.candidates.clone();
-    let covered: BTreeSet<&str> = candidates
-        .iter()
-        .map(|candidate| candidate.source.uri.as_str())
-        .collect();
 
     let mut synthesized = Vec::new();
     for (index, input) in request.work_unit.inputs.iter().enumerate() {
-        if covered.contains(input.uri.as_str()) {
+        let mut covering: Vec<&mut ContextCandidate> = candidates
+            .iter_mut()
+            .filter(|candidate| candidate.source.uri == input.uri)
+            .collect();
+
+        if covering.is_empty() {
+            let candidate = ContextCandidate::new(
+                format!("work-unit-input-{index:04}"),
+                "work-unit-input",
+                input.clone(),
+                ContextClass::CurrentWork,
+                ContextPriority::Required,
+            );
+            synthesized.push(ContextCandidate {
+                selection_reason: "Declared Work Unit input with no projected context candidate"
+                    .to_owned(),
+                ..candidate
+            });
             continue;
         }
-        let candidate = ContextCandidate::new(
-            format!("work-unit-input-{index:04}"),
-            "work-unit-input",
-            input.clone(),
-            ContextClass::CurrentWork,
-            ContextPriority::Required,
+        if covering
+            .iter()
+            .any(|candidate| candidate.priority == ContextPriority::Required)
+        {
+            continue;
+        }
+
+        covering.sort_by(|left, right| left.id.cmp(&right.id));
+        let promoted = covering.swap_remove(0);
+        promoted.priority = ContextPriority::Required;
+        promoted.selection_reason = format!(
+            "{} (promoted to required: declared Work Unit input)",
+            promoted.selection_reason
         );
-        synthesized.push(ContextCandidate {
-            selection_reason: "Declared Work Unit input with no projected context candidate"
-                .to_owned(),
-            ..candidate
-        });
     }
     candidates.extend(synthesized);
 
@@ -272,7 +331,7 @@ fn project_candidates(request: &HydrationRequest) -> Result<Vec<ContextCandidate
     Ok(candidates)
 }
 
-/// Assigns buckets, orders by `(bucket, id)`, and rejects a required pinned
+/// Assigns buckets, orders by [`selection_key`], and rejects a required pinned
 /// candidate that would enter the Boot Package lossily.
 fn rank(candidates: Vec<ContextCandidate>) -> Result<Vec<Ranked>, HydrationError> {
     let mut ranked: Vec<Ranked> = candidates
@@ -282,11 +341,7 @@ fn rank(candidates: Vec<ContextCandidate>) -> Result<Vec<Ranked>, HydrationError
             candidate,
         })
         .collect();
-    ranked.sort_by(|left, right| {
-        left.bucket
-            .cmp(&right.bucket)
-            .then_with(|| left.candidate.id.cmp(&right.candidate.id))
-    });
+    ranked.sort_by(|left, right| selection_key(left).cmp(&selection_key(right)));
 
     for entry in &ranked {
         if entry.bucket == SelectionBucket::RequiredPinned
