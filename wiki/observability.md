@@ -79,7 +79,7 @@ Events, metrics, and logs are complementary views of lifecycle telemetry. Signif
 
 3. **Emit diagnostic signals without changing durable authority.**
    1. Lifecycle spans attach events such as `rotation.requested`, `runner.compaction.reported`, `verification.finding`, `checkpoint.committed`, `execution.suspended`, and `recovery.ambiguity_detected`.
-   2. Facts needed for recovery are also written to the durable Event Journal through the normal storage transaction. The trace event is only a diagnostic copy.
+   2. Facts needed for recovery are recorded in the durable Event Journal when required for recovery. The trace event is only a diagnostic copy.
    3. Low-cardinality metrics may be derived for Episodes, Attempts, rotations, Checkpoint commits, verification, recovery, context tokens, and durations. Entity identifiers are excluded from default metric labels.
    4. Structured logs may carry trace and span identifiers but apply the same redaction boundary as traces and baggage.
 
