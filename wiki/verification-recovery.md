@@ -180,8 +180,9 @@ Implementation has not been assessed.
 
 ### Specification Sources
 
-- `docs/00-project-charter.md` (sections 3 and 8: Goals; Foundational Principles)
-- `docs/01-system-architecture.md` (sections 5 and 6: Controller Components; Primary Execution Flow)
+- `docs/00-project-charter.md` (sections 3, 5, and 8: Goals; Framework Boundaries; Foundational Principles)
+- `docs/01-system-architecture.md` (sections 3, 5, and 6: Crate Responsibilities; Controller Components; Primary Execution Flow)
+- `docs/03-durable-state-and-transactions.md` (sections 3, 5–7, and 9–10: SQLite Tables; Checkpoint Commit through Lease and Fencing; Crash Recovery Matrix; Storage Invariants)
 - `docs/05-work-unit-and-runner-protocol.md` (sections 7 and 9–12: Work Unit Result; Intent Before External Effect through Failure Model)
 - `docs/06-verification-and-recovery.md` (sections 1–16: Purpose through Acceptance Criteria)
 - `docs/07-session-rotation.md` (sections 5, 6, and 12: Work Unit Attempt State Machine; Normal Rotation Sequence; Suspension During Rotation)
