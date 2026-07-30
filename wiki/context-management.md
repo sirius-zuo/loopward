@@ -180,7 +180,7 @@ Implementation has not been assessed.
 ### Specification Sources
 
 - `docs/00-project-charter.md` (sections 2–4 and 8: Motivation; Goals; Non-Goals; Foundational Principles)
-- `docs/01-system-architecture.md` (sections 1 and 5: Architectural Layers; Controller Components)
+- `docs/01-system-architecture.md` (sections 1, 5, and 6: Architectural Layers; Controller Components; Primary Execution Flow)
 - `docs/04-context-lifecycle.md` (sections 1–13: Purpose through Acceptance Criteria)
 - `docs/07-session-rotation.md` (sections 6–11: Normal Rotation Sequence through Compaction Events)
 - `docs/07-session-rotation.md` (section 12: Suspension During Rotation)
