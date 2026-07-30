@@ -109,7 +109,7 @@ A `RuntimeSession` is a replaceable execution generation within an Episode. `Ses
 - **Decision:** Only the Loop Controller may advance Loop lifecycle state; managers, runners, LLM outputs, verification results, and budget observations supply inputs but do not choose authoritative transitions.
 - **Rationale:** No PR or design doc records a rationale; observed current state: the architecture names the Loop Controller as the only component allowed to advance lifecycle state and requires lifecycle decisions to remain deterministic wherever structured state, policy, verification, and observed results are sufficient.
 - **Consequences:** Runner completion and semantic proposals cannot bypass validation or verification, and runtime integrations must report structured evidence and signals to the controller.
-- **Ref:** `docs/01-system-architecture.md` (sections 1 and 5: Architectural Layers; Controller Components); `docs/02-core-domain-model.md` (sections 8, 10, and 12: Observation and Decision; Acceptance and Verification; Pure Transition Interface).
+- **Ref:** `docs/01-system-architecture.md` (sections 1 and 5: Architectural Layers; Controller Components); `docs/02-core-domain-model.md` (section 12: Pure Transition Interface).
 
 ### Make every Episode terminate at a durable boundary
 
@@ -123,7 +123,7 @@ A `RuntimeSession` is a replaceable execution generation within an Episode. `Ses
 - **Decision:** Phase One starts a fresh Runtime Session for each Work Unit by default and treats Session reuse as an opt-in experiment.
 - **Rationale:** No PR or design doc records a rationale; observed current state: Phase One policy requires deterministic rotation at Work Unit, verification, phase, context-integrity, and runner-failure boundaries while the evaluation compares this default with runner-managed continuous Sessions where available.
 - **Consequences:** Each Work Unit receives bounded reconstructed context, closed and failed generations remain terminal, and evaluation must measure any rework or cost introduced by replacement.
-- **Ref:** `docs/07-session-rotation.md` (sections 4, 8, and 15: Runtime Session State Machine; Phase One Policy; Acceptance Criteria); `docs/10-mvp-and-evaluation.md` (sections 6, 9.2, and 13: Reference Scenario; Real-runner evaluation; Phase One Acceptance Gates).
+- **Ref:** `docs/07-session-rotation.md` (sections 4, 8, and 15: Runtime Session State Machine; Phase One Policy; Acceptance Criteria); `docs/10-mvp-and-evaluation.md` (sections 6 and 13: Reference Scenario; Phase One Acceptance Gates).
 
 ### Keep budget management advisory to lifecycle policy
 
