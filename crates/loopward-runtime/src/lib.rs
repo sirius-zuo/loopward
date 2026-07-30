@@ -14,7 +14,7 @@
 pub mod ports;
 
 pub use ports::{
-    AcquireLease, CheckpointCommitRequest, Clock, IdGenerator, LoopLease, LoopStore, RecordedEvent,
-    ResourceBeginHint, ResourceBroker, ResourceError, ResourceHandle, RuntimeInstanceId,
-    RuntimePorts, StoreError, StoredLoop,
+    AcquireLease, CheckpointCommitRequest, Clock, EVENT_SCHEMA_VERSION, IdGenerator, LoopLease,
+    LoopStore, RecordedEvent, ResourceBeginHint, ResourceBroker, ResourceError, ResourceHandle,
+    RuntimeInstanceId, RuntimePorts, StoreError, StoredLoop,
 };

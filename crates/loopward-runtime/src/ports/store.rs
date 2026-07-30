@@ -8,14 +8,21 @@
 //! trait; the concrete `SQLite`-backed implementation lives in a separate
 //! adapter crate.
 //!
-//! [`LoopStore`] deliberately has no "create a Loop" method: Phase One's
-//! only durable events are lifecycle facts `loopward-core` decided
-//! (`loopward_core::LoopEvent` has no `LoopCreated` variant), and genesis
-//! Checkpoint persistence is a driver/controller concern this port task
-//! does not resolve. A real implementation is free to treat `load` against
-//! an unknown [`LoopId`] as [`StoreError::LoopNotFound`] and let the first
-//! [`LoopStore::commit_checkpoint`] (with `expected_revision: 0` and
-//! `expected_checkpoint_version: 0`) establish the genesis state.
+//! [`LoopStore`] deliberately has no separate "create a Loop" method: Phase
+//! One's only durable events are lifecycle facts `loopward-core` decided
+//! (`loopward_core::LoopEvent` has no `LoopCreated` variant), and the
+//! genesis Checkpoint is itself just a Checkpoint commit with no parent
+//! (`docs/02-core-domain-model.md` §7: "absent only for the genesis
+//! Checkpoint"). A real implementation MUST therefore treat `load` against
+//! an unknown [`LoopId`] as [`StoreError::LoopNotFound`], and MUST accept a
+//! [`LoopStore::commit_checkpoint`] against an unknown `loop_id` as genesis
+//! creation exactly when both `expected_revision` and
+//! `expected_checkpoint_version` are `0` — any other combination against an
+//! unknown `loop_id` stays a [`StoreError::LoopNotFound`]. This is not just
+//! asserted here: the fake `InMemoryLoopStore` in
+//! `tests/port_contract.rs` implements exactly this rule, and
+//! `commit_checkpoint_creates_a_fresh_loop_and_then_updates_it` drives a
+//! brand-new [`LoopId`] through it with no other seam.
 
 use std::fmt;
 use std::str::FromStr;
@@ -78,6 +85,13 @@ impl FromStr for RuntimeInstanceId {
     }
 }
 
+/// The event journal schema version this runtime writes, matching
+/// `docs/schemas/event-v0.1.yaml`'s `schema_version: loopward.event/v0.1`
+/// and the same `loopward.<thing>/vX.Y` convention `loopward-api` already
+/// uses for `PROTOCOL_VERSION` and `loopward_api::event::LoopEvent`'s own
+/// `schema_version` field.
+pub const EVENT_SCHEMA_VERSION: &str = "loopward.event/v0.1";
+
 /// One durable event as recorded in the Loop's append-only journal
 /// (`docs/03-durable-state-and-transactions.md` §6): the domain fact
 /// [`loopward_core::decide`] produced, plus the journal metadata the
@@ -93,6 +107,12 @@ pub struct RecordedEvent {
     pub sequence: u64,
     /// The aggregate revision this event advanced the Loop to.
     pub aggregate_revision: u64,
+    /// The event schema version this record conforms to. Unlike trace/span
+    /// ids, §6 states schema version is recorded unconditionally
+    /// ("Each event records Loop sequence, aggregate revision, schema
+    /// version, timestamp, and current trace/span IDs *when available*") —
+    /// see [`EVENT_SCHEMA_VERSION`].
+    pub schema_version: String,
     /// When the runtime durably recorded this event.
     pub recorded_at: Timestamp,
     /// The domain fact.
@@ -234,7 +254,13 @@ pub enum StoreError {
     /// No lease is currently held for the given Loop.
     #[error("no active lease for {0}")]
     LeaseNotHeld(LoopId),
-    /// Another runtime instance already holds an unexpired lease.
+    /// A different runtime instance already holds this Loop's lease.
+    ///
+    /// Returned by [`LoopStore::acquire_lease`] when the requested
+    /// `holder_id` differs from the current holder's; the same holder MAY
+    /// re-acquire (e.g. after restarting with a stable identity), which
+    /// still bumps `fencing_token` (§7: "reacquisition increments the
+    /// fencing token").
     #[error("lease for {0} is held by another runtime instance")]
     LeaseConflict(LoopId),
     /// The underlying storage backend failed in a way this port does not
@@ -273,7 +299,8 @@ pub trait LoopStore: Send + Sync {
     ) -> Result<StoredLoop, StoreError>;
 
     /// Acquires the exclusive driving lease for a Loop, incrementing the
-    /// fencing token (§7).
+    /// fencing token (§7). Rejected with [`StoreError::LeaseConflict`] if a
+    /// different runtime instance currently holds an unexpired lease.
     async fn acquire_lease(&self, request: AcquireLease) -> Result<LoopLease, StoreError>;
 
     /// Renews an already-held lease, extending its expiry without changing

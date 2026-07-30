@@ -20,8 +20,8 @@ pub use clock::Clock;
 pub use id_generator::IdGenerator;
 pub use resource::{ResourceBeginHint, ResourceBroker, ResourceError, ResourceHandle};
 pub use store::{
-    AcquireLease, CheckpointCommitRequest, LoopLease, LoopStore, RecordedEvent, RuntimeInstanceId,
-    StoreError, StoredLoop,
+    AcquireLease, CheckpointCommitRequest, EVENT_SCHEMA_VERSION, LoopLease, LoopStore,
+    RecordedEvent, RuntimeInstanceId, StoreError, StoredLoop,
 };
 
 /// One concrete set of ports a running driver uses to advance Loops.

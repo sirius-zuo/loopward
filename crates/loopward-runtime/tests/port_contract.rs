@@ -27,9 +27,9 @@ use loopward_api::work_unit::ResourceBudget;
 use loopward_core::{AggregateState, Checkpoint, LoopEvent, LoopExecution, LoopStatus};
 use loopward_observability::NoopTelemetrySink;
 use loopward_runtime::ports::{
-    AcquireLease, CheckpointCommitRequest, Clock, IdGenerator, LoopLease, LoopStore, RecordedEvent,
-    ResourceBeginHint, ResourceBroker, ResourceError, ResourceHandle, RuntimeInstanceId,
-    RuntimePorts, StoreError, StoredLoop,
+    AcquireLease, CheckpointCommitRequest, Clock, EVENT_SCHEMA_VERSION, IdGenerator, LoopLease,
+    LoopStore, RecordedEvent, ResourceBeginHint, ResourceBroker, ResourceError, ResourceHandle,
+    RuntimeInstanceId, RuntimePorts, StoreError, StoredLoop,
 };
 use uuid::Uuid;
 
@@ -279,6 +279,7 @@ impl LoopStore for InMemoryLoopStore {
                 event_id: self.event_ids.new_event_id(),
                 sequence: stored.events.len() as u64 + 1,
                 aggregate_revision: stored.state.execution.aggregate_revision,
+                schema_version: EVENT_SCHEMA_VERSION.to_owned(),
                 recorded_at: Timestamp::UNIX_EPOCH,
                 event,
             });
@@ -305,31 +306,61 @@ impl LoopStore for InMemoryLoopStore {
         }
 
         let mut loops = self.loops.lock().expect("loops lock poisoned");
-        let stored = loops
-            .get_mut(&request.loop_id)
-            .ok_or(StoreError::LoopNotFound(request.loop_id))?;
 
-        if stored.state.execution.aggregate_revision != request.expected_revision {
+        // No row yet: the only legal request is a genesis commit, exactly
+        // when the caller expects a blank aggregate revision and blank
+        // checkpoint version (`docs/02-core-domain-model.md` §7: the
+        // genesis Checkpoint has no parent; `docs/03` §5). Any other
+        // expectation against a nonexistent Loop stays `LoopNotFound`
+        // rather than silently creating a row out of thin air.
+        let Some(existing) = loops.get(&request.loop_id) else {
+            if request.expected_revision != 0 || request.expected_checkpoint_version != 0 {
+                return Err(StoreError::LoopNotFound(request.loop_id));
+            }
+            let mut events = Vec::new();
+            for (ordinal, event) in request.events.into_iter().enumerate() {
+                let position = ordinal as u64 + 1;
+                events.push(RecordedEvent {
+                    event_id: self.event_ids.new_event_id(),
+                    sequence: position,
+                    aggregate_revision: position,
+                    schema_version: EVENT_SCHEMA_VERSION.to_owned(),
+                    recorded_at: Timestamp::UNIX_EPOCH,
+                    event,
+                });
+            }
+            let mut state = request.state;
+            state.checkpoint = request.checkpoint;
+            let stored_loop = StoredLoop { state, events };
+            loops.insert(request.loop_id, stored_loop.clone());
+            return Ok(stored_loop);
+        };
+
+        if existing.state.execution.aggregate_revision != request.expected_revision {
             return Err(StoreError::RevisionConflict {
                 loop_id: request.loop_id,
                 expected: request.expected_revision,
-                actual: stored.state.execution.aggregate_revision,
+                actual: existing.state.execution.aggregate_revision,
             });
         }
-        if stored.state.execution.checkpoint_version != request.expected_checkpoint_version {
+        if existing.state.execution.checkpoint_version != request.expected_checkpoint_version {
             return Err(StoreError::CheckpointVersionConflict {
                 loop_id: request.loop_id,
                 expected: request.expected_checkpoint_version,
-                actual: stored.state.execution.checkpoint_version,
+                actual: existing.state.execution.checkpoint_version,
             });
         }
 
+        let stored = loops
+            .get_mut(&request.loop_id)
+            .expect("checked present above");
         for event in request.events {
             stored.state.execution.aggregate_revision += 1;
             stored.events.push(RecordedEvent {
                 event_id: self.event_ids.new_event_id(),
                 sequence: stored.events.len() as u64 + 1,
                 aggregate_revision: stored.state.execution.aggregate_revision,
+                schema_version: EVENT_SCHEMA_VERSION.to_owned(),
                 recorded_at: Timestamp::UNIX_EPOCH,
                 event,
             });
@@ -340,6 +371,13 @@ impl LoopStore for InMemoryLoopStore {
     }
 
     async fn acquire_lease(&self, request: AcquireLease) -> Result<LoopLease, StoreError> {
+        let mut leases = self.leases.lock().expect("leases lock poisoned");
+        if let Some(existing) = leases.get(&request.loop_id)
+            && existing.holder_id != request.holder_id
+        {
+            return Err(StoreError::LeaseConflict(request.loop_id));
+        }
+
         let mut tokens = self
             .fencing_tokens
             .lock()
@@ -355,10 +393,7 @@ impl LoopStore for InMemoryLoopStore {
             acquired_at: now,
             expires_at: now + request.ttl,
         };
-        self.leases
-            .lock()
-            .expect("leases lock poisoned")
-            .insert(request.loop_id, lease);
+        leases.insert(request.loop_id, lease);
         Ok(lease)
     }
 
@@ -523,6 +558,275 @@ async fn lease_fencing_token_gates_appends_and_survives_renewal() {
         .expect("renewal succeeds");
     assert_eq!(renewed.fencing_token, lease.fencing_token);
     assert!(renewed.expires_at > lease.expires_at);
+}
+
+#[tokio::test]
+async fn append_rejects_stale_aggregate_revision() {
+    let (ports, loop_id, _fixed_now) = build_ports();
+
+    let holder = RuntimeInstanceId::new();
+    let lease = ports
+        .store
+        .acquire_lease(AcquireLease {
+            loop_id,
+            holder_id: holder,
+            ttl: time::Duration::seconds(30),
+        })
+        .await
+        .expect("lease acquisition succeeds");
+
+    // The genesis state seeded by `build_ports` starts at aggregate
+    // revision 0; presenting any other expected revision must be rejected
+    // even though the fencing token is correct (§2, §10) — distinct from
+    // `StaleFencingToken`, which the lease-fencing test above already
+    // covers.
+    let result = ports
+        .store
+        .append(
+            loop_id,
+            5,
+            lease.fencing_token,
+            vec![LoopEvent::LoopCompleted],
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(StoreError::RevisionConflict {
+            expected: 5,
+            actual: 0,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn commit_checkpoint_creates_a_fresh_loop_and_then_updates_it() {
+    let (ports, _seeded_loop_id, _fixed_now) = build_ports();
+
+    // A brand-new Loop, never seeded: `LoopStore` has no separate creation
+    // method, so this drives genesis purely through the trait —
+    // `commit_checkpoint` with `expected_revision: 0` and
+    // `expected_checkpoint_version: 0` against an unknown `loop_id`
+    // (`docs/02-core-domain-model.md` §7, `docs/03` §5).
+    let loop_id = ports.ids.new_loop_id();
+    let holder = RuntimeInstanceId::new();
+    let lease = ports
+        .store
+        .acquire_lease(AcquireLease {
+            loop_id,
+            holder_id: holder,
+            ttl: time::Duration::seconds(30),
+        })
+        .await
+        .expect("lease acquisition succeeds");
+
+    let genesis_checkpoint = Checkpoint {
+        id: CheckpointId::new(),
+        loop_id,
+        version: 1,
+        aggregate_revision: 1,
+        parent: None,
+        episode_id: None,
+        integrity_digest: None,
+    };
+    let mut genesis = genesis_state(loop_id);
+    genesis.execution.aggregate_revision = 1;
+    genesis.execution.checkpoint_version = 1;
+    genesis.checkpoint = genesis_checkpoint.clone();
+
+    let created = ports
+        .store
+        .commit_checkpoint(CheckpointCommitRequest {
+            loop_id,
+            expected_revision: 0,
+            expected_checkpoint_version: 0,
+            fencing_token: lease.fencing_token,
+            checkpoint: genesis_checkpoint.clone(),
+            events: vec![LoopEvent::CheckpointCommitted {
+                checkpoint: genesis_checkpoint.clone(),
+            }],
+            state: genesis.clone(),
+        })
+        .await
+        .expect("genesis commit succeeds against an unknown loop_id");
+    assert_eq!(created.state.execution.aggregate_revision, 1);
+    assert_eq!(created.state.execution.checkpoint_version, 1);
+    assert_eq!(created.events.len(), 1);
+
+    // Loading now succeeds through the trait alone: no seed backdoor was
+    // used for this Loop.
+    let loaded = ports.store.load(loop_id).await.expect("load succeeds");
+    assert_eq!(loaded.state.execution.id, loop_id);
+
+    // A second, authoritative commit against the now-existing Loop is
+    // fenced against the revision and checkpoint version the genesis
+    // commit just established.
+    let second_checkpoint = Checkpoint {
+        id: CheckpointId::new(),
+        loop_id,
+        version: 2,
+        aggregate_revision: 2,
+        parent: Some(genesis_checkpoint.id),
+        episode_id: None,
+        integrity_digest: None,
+    };
+    let mut second_state = genesis;
+    second_state.execution.aggregate_revision = 2;
+    second_state.execution.checkpoint_version = 2;
+    second_state.checkpoint = second_checkpoint.clone();
+
+    let updated = ports
+        .store
+        .commit_checkpoint(CheckpointCommitRequest {
+            loop_id,
+            expected_revision: 1,
+            expected_checkpoint_version: 1,
+            fencing_token: lease.fencing_token,
+            checkpoint: second_checkpoint,
+            events: vec![],
+            state: second_state,
+        })
+        .await
+        .expect("commit against the existing loop succeeds");
+    assert_eq!(updated.state.execution.checkpoint_version, 2);
+    assert_eq!(updated.events.len(), 1); // unchanged: this commit added no new events
+}
+
+#[tokio::test]
+async fn commit_checkpoint_rejects_stale_revision_and_checkpoint_version() {
+    let (ports, loop_id, _fixed_now) = build_ports();
+
+    let holder = RuntimeInstanceId::new();
+    let lease = ports
+        .store
+        .acquire_lease(AcquireLease {
+            loop_id,
+            holder_id: holder,
+            ttl: time::Duration::seconds(30),
+        })
+        .await
+        .expect("lease acquisition succeeds");
+
+    let checkpoint = Checkpoint {
+        id: CheckpointId::new(),
+        loop_id,
+        version: 1,
+        aggregate_revision: 1,
+        parent: None,
+        episode_id: None,
+        integrity_digest: None,
+    };
+    let mut state = genesis_state(loop_id);
+    state.execution.aggregate_revision = 1;
+    state.execution.checkpoint_version = 1;
+    state.checkpoint = checkpoint.clone();
+
+    // Wrong expected revision against the seeded genesis (0).
+    let revision_conflict = ports
+        .store
+        .commit_checkpoint(CheckpointCommitRequest {
+            loop_id,
+            expected_revision: 9,
+            expected_checkpoint_version: 0,
+            fencing_token: lease.fencing_token,
+            checkpoint: checkpoint.clone(),
+            events: vec![],
+            state: state.clone(),
+        })
+        .await;
+    assert!(matches!(
+        revision_conflict,
+        Err(StoreError::RevisionConflict {
+            expected: 9,
+            actual: 0,
+            ..
+        })
+    ));
+
+    // Correct revision but wrong expected checkpoint version.
+    let checkpoint_conflict = ports
+        .store
+        .commit_checkpoint(CheckpointCommitRequest {
+            loop_id,
+            expected_revision: 0,
+            expected_checkpoint_version: 7,
+            fencing_token: lease.fencing_token,
+            checkpoint,
+            events: vec![],
+            state,
+        })
+        .await;
+    assert!(matches!(
+        checkpoint_conflict,
+        Err(StoreError::CheckpointVersionConflict {
+            expected: 7,
+            actual: 0,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn renew_lease_without_prior_acquisition_is_rejected() {
+    let (ports, loop_id, _fixed_now) = build_ports();
+
+    // A lease this store never granted (e.g. reconstructed from a stale
+    // in-memory copy after a restart): renewal must fail rather than
+    // silently succeed.
+    let phantom_lease = LoopLease {
+        loop_id,
+        holder_id: RuntimeInstanceId::new(),
+        fencing_token: 1,
+        acquired_at: Timestamp::UNIX_EPOCH,
+        expires_at: Timestamp::UNIX_EPOCH + time::Duration::seconds(30),
+    };
+
+    let result = ports.store.renew_lease(&phantom_lease).await;
+    assert!(matches!(result, Err(StoreError::LeaseNotHeld(id)) if id == loop_id));
+}
+
+#[tokio::test]
+async fn lease_conflict_when_another_holder_still_holds_the_lease() {
+    let (ports, loop_id, _fixed_now) = build_ports();
+
+    let first_holder = RuntimeInstanceId::new();
+    let first_lease = ports
+        .store
+        .acquire_lease(AcquireLease {
+            loop_id,
+            holder_id: first_holder,
+            ttl: time::Duration::seconds(30),
+        })
+        .await
+        .expect("first acquisition succeeds");
+    assert_eq!(first_lease.fencing_token, 1);
+
+    // A different holder cannot steal the lease while it is still tracked
+    // as held (§7: "at most one driver may mutate a Loop").
+    let second_holder = RuntimeInstanceId::new();
+    let conflict = ports
+        .store
+        .acquire_lease(AcquireLease {
+            loop_id,
+            holder_id: second_holder,
+            ttl: time::Duration::seconds(30),
+        })
+        .await;
+    assert!(matches!(conflict, Err(StoreError::LeaseConflict(id)) if id == loop_id));
+
+    // The same holder MAY re-acquire — e.g. after restarting with a stable
+    // identity — and doing so still bumps the fencing token (§7:
+    // "reacquisition increments the fencing token").
+    let reacquired = ports
+        .store
+        .acquire_lease(AcquireLease {
+            loop_id,
+            holder_id: first_holder,
+            ttl: time::Duration::seconds(30),
+        })
+        .await
+        .expect("same holder can re-acquire");
+    assert_eq!(reacquired.fencing_token, 2);
 }
 
 #[tokio::test]
