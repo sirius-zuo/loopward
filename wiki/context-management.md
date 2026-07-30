@@ -2,13 +2,13 @@
 
 ## Purpose
 
-Context management reconstructs bounded, task-specific input for each replaceable Runtime Session without treating conversation history as authoritative state. The `loopward-runtime` Context Manager turns a committed Checkpoint, current Work Unit, declared runner capabilities, and an explicit context budget into an auditable Boot Package. It preserves pinned constraints losslessly, keeps large resources outside the prompt when possible, and records provenance and selection reasons for every included item. The subsystem also validates structured handoff proposals so compaction and Session rotation can contribute to durable progress without directly mutating authoritative state.
+Context management reconstructs bounded, task-specific input for each replaceable Runtime Session without treating conversation history as authoritative state. The `loopward-runtime` Context Manager constructs bounded, auditable Boot Packages. The deterministic hydration pipeline uses a committed Checkpoint, current Work Unit, declared runner capabilities, and an explicit context budget; pinned constraints remain lossless, while every materialized item records provenance and a selection reason. (`docs/01-system-architecture.md`, section 5: Controller Components; `docs/04-context-lifecycle.md`, sections 1–7: Purpose through Boot Package)
 
 ## Position in the System
 
-The Context Manager is a first-class component of `loopward-runtime`. It consumes Checkpoint and Work Unit state defined by the [Core Domain](core-domain.md), stable identifiers and runner capability contracts from the [Public API](public-api.md), and budgets and lifecycle direction from the [Runtime Lifecycle](runtime-lifecycle.md). It accesses large artifacts through the Resource Broker and coordinates runner-specific materialization with [Work Unit Execution](work-unit-execution.md).
+The Context Manager is a first-class component of `loopward-runtime`, separate from the Session Manager. The Loop Controller invokes it in the primary execution flow to assemble a Boot Package, and the architecture connects it to the Resource Broker. (`docs/01-system-architecture.md`, sections 1, 5, and 6: Architectural Layers; Controller Components; Primary Execution Flow)
 
-The [Durable State](durable-state.md) subsystem persists Checkpoints, resource metadata, Boot Package references, access events, and accepted handoff outcomes. [Verification and Recovery](verification-recovery.md) validates proposed claims and handles missing resources or ambiguous handoffs, while [Observability](observability.md) records context construction, resource access, compaction, estimates, and rotation signals without requiring sensitive payload capture. Context management supplies a bounded package to execution; it does not own Loop transitions, accept runner proposals, or choose Session lifecycle outcomes.
+The Context Manager constructs the bounded package used by [Work Unit Execution](work-unit-execution.md). The Loop Controller alone advances lifecycle state; Session rotation, verification, and Checkpoint commit remain runtime lifecycle responsibilities rather than Context Manager responsibilities. (`docs/01-system-architecture.md`, sections 5 and 6: Controller Components; Primary Execution Flow; `docs/07-session-rotation.md`, section 6: Normal Rotation Sequence)
 
 ## Architecture
 
@@ -17,7 +17,6 @@ classDiagram
     class ContextManager {
         +hydrate(Checkpoint, WorkUnit, ContextCapabilities, ContextBudget)
         +materialize(BootPackageManifest)
-        +validate_handoff(HandoffProposal)
     }
     class ContextCapabilities {
         +ContextControlLevel control_level
@@ -87,7 +86,6 @@ classDiagram
     BootPackageManifest *-- ContextBudget : binds
     ContextManager --> ResourceBroker : resolves references
     ResourceBroker --> ResourceGrant : enforces
-    ContextManager --> HandoffProposal : validates
 ```
 
 `ContextCapabilities` records the runner's actual level of context control: `Opaque`, `Observable`, `ManagedBoot`, or `Managed`. Capability discovery is descriptive; the Context Manager cannot assume incremental resource fetch, structured handoff, resume, usage reporting, or compaction reporting unless the runner declares it. (`docs/04-context-lifecycle.md`, section 3: Context Capability Levels)
@@ -100,7 +98,7 @@ Before materializing payloads, the Context Manager represents candidates as `Con
 
 `ResourceGrant` scopes retrieval permissions to an active Work Unit, with optional expiry. The Resource Broker makes access auditable, enforces permissions, and checks immutable digests when required. Runners without scoped retrieval support instead receive a fully materialized Boot Package that fits the budget. (`docs/04-context-lifecycle.md`, section 8: Resource References and On-Demand Retrieval)
 
-`HandoffProposal` separates completed and active work, unresolved issues, observations, decision proposals, resources, and a recommended next action. It is an untrusted proposal: schema, pinned digest, evidence, resource versions, verification state, policy, and conflicts with active decisions must be checked before any content reaches a committed Checkpoint. (`docs/04-context-lifecycle.md`, section 9: Compaction and Structured Handoff)
+`HandoffProposal` separates completed and active work, unresolved issues, observations, decision proposals, resources, and a recommended next action. It is an untrusted proposal. Before Checkpoint commit, the runtime validates its schema, pinned digest, evidence, resource versions when applicable, claim status, policy, and conflicts with active decisions. The specifications do not assign this validation to the Context Manager. (`docs/04-context-lifecycle.md`, section 9: Compaction and Structured Handoff; `docs/07-session-rotation.md`, section 6: Normal Rotation Sequence)
 
 ## Runtime Flows
 
@@ -181,10 +179,11 @@ Implementation has not been assessed.
 
 ### Specification Sources
 
-- `docs/00-project-charter.md` (sections 2–3 and 8: Motivation; Goals; Foundational Principles)
+- `docs/00-project-charter.md` (sections 2–4 and 8: Motivation; Goals; Non-Goals; Foundational Principles)
 - `docs/01-system-architecture.md` (sections 1 and 5: Architectural Layers; Controller Components)
 - `docs/04-context-lifecycle.md` (sections 1–13: Purpose through Acceptance Criteria)
-- `docs/07-session-rotation.md` (sections 6–12: Normal Rotation Sequence through Suspension During Rotation)
+- `docs/07-session-rotation.md` (sections 6–11: Normal Rotation Sequence through Compaction Events)
+- `docs/07-session-rotation.md` (section 12: Suspension During Rotation)
 - `docs/schemas/boot-package-manifest-v0.1.yaml` (example manifest for schema version loopward.boot-package-manifest/v0.1)
 
 ### Implementation Sources
