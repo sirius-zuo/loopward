@@ -376,3 +376,46 @@ pub struct ContinuationProposal {
     /// Additional free-form detail about the proposed continuation.
     pub detail: Option<String>,
 }
+
+/// A runner's structured proposal for durable-state handoff, converting an
+/// execution trajectory into a candidate for the next Checkpoint rather than
+/// an ordinary conversation summary (`docs/04-context-lifecycle.md` §9).
+///
+/// This is a proposal only: none of its contents mutate authoritative Loop
+/// state until Loopward validates it (schema validation, pinned digest
+/// comparison, evidence reference validation, workspace/resource-version
+/// validation, verified-vs-unverified distinction, policy validation, and
+/// conflict detection with active decisions) and commits a Checkpoint.
+/// `pinned_digest_seen` is the drain-side half of the pinned-constraint
+/// integrity check whose hydration-side half is
+/// [`BootPackageManifest::pinned_digest`]: pinned constraints must survive
+/// hydration and drain losslessly, and a mismatch between the two digests
+/// means the runner drained against stale or divergent pinned state.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HandoffProposal {
+    /// Work the runner asserts is now complete.
+    #[serde(default)]
+    pub completed_work: Vec<StateAssertionProposal>,
+    /// Work the runner asserts is still in progress.
+    #[serde(default)]
+    pub active_work: Vec<StateAssertionProposal>,
+    /// Issues the runner reports as still open and unresolved.
+    #[serde(default)]
+    pub unresolved: Vec<OpenIssueProposal>,
+    /// Observations proposed for the next Checkpoint.
+    #[serde(default)]
+    pub observations: Vec<ObservationProposal>,
+    /// Decisions proposed for the next Checkpoint. Decision proposals do not
+    /// become active decisions automatically.
+    #[serde(default)]
+    pub decision_proposals: Vec<DecisionProposal>,
+    /// Resources relevant to this handoff.
+    #[serde(default)]
+    pub relevant_resources: Vec<ResourceRef>,
+    /// The runner's recommended next action, when it has one.
+    pub recommended_next_action: Option<ContinuationProposal>,
+    /// A digest of the pinned state the runner saw at drain time, compared
+    /// against the pinned digest recorded at hydration time before this
+    /// proposal can be accepted.
+    pub pinned_digest_seen: String,
+}

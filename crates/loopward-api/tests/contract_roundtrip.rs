@@ -6,12 +6,18 @@
 //! variants.
 
 use loopward_api::context::{
-    BootPackageManifest, ContextBudget, ContextClass, ContextItem, ContextPriority, Fidelity,
-    Sensitivity, Validity,
+    BootPackageManifest, ContextBudget, ContextClass, ContextItem, ContextPriority,
+    ContinuationProposal, DecisionProposal, Fidelity, HandoffProposal, ObservationProposal,
+    OpenIssueProposal, Sensitivity, StateAssertionProposal, Validity, VerificationStatus,
 };
-use loopward_api::ids::{AttemptId, EpisodeId, LoopId, SessionId, WorkUnitId};
+use loopward_api::ids::{AttemptId, EpisodeId, LoopId, SessionId, Timestamp, WorkUnitId};
+use loopward_api::loop_service::{
+    CommandMetadata, Constraint, ConstraintScope, ConstraintSource, CreateLoopRequest, EpisodeRef,
+    Goal, LoopKind, LoopOutcome, LoopOutcomeKind, LoopPolicies, LoopStatus, LoopStatusView,
+    SuccessCriterion, SuccessCriterionStatus, SuspensionView,
+};
 use loopward_api::resource::{
-    CheckpointRef, OutputContract, ResourceRef, RunnerRef, VerificationPlanRef,
+    CheckpointRef, OutputContract, PhaseRef, ResourceRef, RunnerRef, SchemaRef, VerificationPlanRef,
 };
 use loopward_api::trace::TraceContext;
 use loopward_api::work_unit::{
@@ -175,5 +181,180 @@ fn unknown_context_class_variant_fails_deserialization_with_a_typed_error() {
     assert!(
         result.is_err(),
         "unknown ContextClass variant must not deserialize"
+    );
+}
+
+fn sample_handoff_proposal() -> HandoffProposal {
+    HandoffProposal {
+        completed_work: vec![StateAssertionProposal {
+            statement: "Implemented the identifier newtypes.".to_string(),
+            evidence: vec![ResourceRef {
+                uri: "resource://diff/001".to_string(),
+                media_type: None,
+                digest: Some("sha256:diff".to_string()),
+                version: None,
+                size: None,
+                summary: None,
+            }],
+            confidence: Some(0.9),
+        }],
+        active_work: vec![StateAssertionProposal {
+            statement: "Implementing the runner protocol.".to_string(),
+            evidence: vec![],
+            confidence: None,
+        }],
+        unresolved: vec![OpenIssueProposal {
+            statement: "LoopPolicies shape is still open.".to_string(),
+            severity: Some("advisory".to_string()),
+            evidence: vec![],
+        }],
+        observations: vec![ObservationProposal {
+            statement: "The contract round-trips losslessly.".to_string(),
+            verification_status: VerificationStatus::Verified,
+            evidence: vec![],
+        }],
+        decision_proposals: vec![DecisionProposal {
+            statement: "Keep proposal types append-only.".to_string(),
+            rationale: Some("Preserves drain-side losslessness.".to_string()),
+            alternatives_considered: vec!["Mutate in place".to_string()],
+        }],
+        relevant_resources: vec![ResourceRef {
+            uri: "resource://output/017".to_string(),
+            media_type: None,
+            digest: Some("sha256:output".to_string()),
+            version: None,
+            size: None,
+            summary: None,
+        }],
+        recommended_next_action: Some(ContinuationProposal {
+            kind: "verify".to_string(),
+            detail: None,
+        }),
+        pinned_digest_seen: "sha256:pinned".to_string(),
+    }
+}
+
+#[test]
+fn handoff_proposal_round_trips_through_json_losslessly() {
+    let proposal = sample_handoff_proposal();
+
+    let encoded = serde_json::to_string(&proposal).expect("serialize HandoffProposal");
+    let decoded: HandoffProposal =
+        serde_json::from_str(&encoded).expect("deserialize HandoffProposal");
+
+    assert_eq!(decoded.pinned_digest_seen, "sha256:pinned");
+    assert_eq!(decoded, proposal);
+}
+
+fn sample_create_loop_request() -> CreateLoopRequest {
+    let mut policy_values = std::collections::BTreeMap::new();
+    policy_values.insert(
+        "allow_unverified_completion".to_string(),
+        serde_json::json!(false),
+    );
+    policy_values.insert("max_retries".to_string(), serde_json::json!(3));
+
+    CreateLoopRequest {
+        metadata: CommandMetadata {
+            request_id: "request-001".to_string(),
+            idempotency_key: "create-loop-001".to_string(),
+            expected_revision: None,
+            principal: None,
+            trace_context: TraceContext {
+                traceparent: Some(
+                    "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_string(),
+                ),
+                tracestate: None,
+                baggage: vec![],
+            },
+        },
+        protocol_version: loopward_api::PROTOCOL_VERSION.to_string(),
+        kind: LoopKind::new("domain.example"),
+        goal: Goal {
+            statement: "Complete the durable task.".to_string(),
+        },
+        success_criteria: vec![SuccessCriterion {
+            id: "criterion-001".to_string(),
+            statement: "All required verification gates pass.".to_string(),
+            status: SuccessCriterionStatus::Pending,
+        }],
+        pinned_constraints: vec![Constraint {
+            id: "constraint-001".to_string(),
+            statement: "Preserve the public contract.".to_string(),
+            source: ConstraintSource::User,
+            scope: ConstraintScope::Loop,
+        }],
+        domain_schema: SchemaRef::new("loopward.domain.example/v0.1"),
+        initial_domain_state: serde_json::json!({}),
+        policies: LoopPolicies {
+            values: policy_values,
+        },
+    }
+}
+
+#[test]
+fn create_loop_request_round_trips_through_json_losslessly() {
+    let request = sample_create_loop_request();
+
+    let encoded = serde_json::to_string(&request).expect("serialize CreateLoopRequest");
+    let decoded: CreateLoopRequest =
+        serde_json::from_str(&encoded).expect("deserialize CreateLoopRequest");
+
+    assert_eq!(decoded.kind, request.kind);
+    assert_eq!(decoded.goal, request.goal);
+    assert_eq!(decoded.success_criteria, request.success_criteria);
+    assert_eq!(decoded.pinned_constraints, request.pinned_constraints);
+    assert_eq!(decoded.domain_schema, request.domain_schema);
+    // The flattened `LoopPolicies` bag is the one construct in this crate
+    // whose round-trip can't be verified by inspection alone: confirm both
+    // the flattened keys and their values survive exactly.
+    assert_eq!(decoded.policies.values, request.policies.values);
+    assert_eq!(decoded.policies.values.len(), 2);
+    assert_eq!(decoded.policies.values["max_retries"], serde_json::json!(3));
+
+    assert_eq!(decoded, request);
+}
+
+#[test]
+fn loop_status_view_round_trips_through_json_losslessly() {
+    let view = LoopStatusView {
+        loop_id: LoopId::new(),
+        status: LoopStatus::Active,
+        phase: PhaseRef::new("implementation"),
+        aggregate_revision: 7,
+        checkpoint_version: 1,
+        active_episode: Some(EpisodeRef {
+            episode_id: EpisodeId::new(),
+            ordinal: 3,
+        }),
+        active_work_unit: Some(loopward_api::loop_service::WorkUnitRef {
+            work_unit_id: WorkUnitId::new(),
+            kind: WorkUnitKind::new("domain.example"),
+        }),
+        suspension: Some(SuspensionView {
+            reason: "verification_pending".to_string(),
+            since: Timestamp::from_unix_timestamp(1_800_000_000).expect("valid unix timestamp"),
+            detail: Some("Awaiting human review.".to_string()),
+        }),
+        terminal_outcome: Some(LoopOutcome {
+            kind: LoopOutcomeKind::Completed,
+            summary: Some("All success criteria satisfied.".to_string()),
+        }),
+    };
+
+    let encoded = serde_json::to_string(&view).expect("serialize LoopStatusView");
+    let decoded: LoopStatusView =
+        serde_json::from_str(&encoded).expect("deserialize LoopStatusView");
+
+    assert_eq!(decoded, view);
+}
+
+#[test]
+fn unknown_loop_status_variant_fails_deserialization_with_a_typed_error() {
+    let json = serde_json::json!("not_a_real_loop_status");
+    let result: Result<LoopStatus, serde_json::Error> = serde_json::from_value(json);
+    assert!(
+        result.is_err(),
+        "unknown LoopStatus variant must not deserialize"
     );
 }
