@@ -11,8 +11,10 @@
 //! that depend on these traits, never the reverse; the controller that
 //! actually drives an Episode forward is built on top of them separately.
 
+pub mod context;
 pub mod ports;
 
+pub use context::{ContextHydrator, HydrationError, HydrationReport, HydrationRequest};
 pub use ports::{
     AcquireLease, CheckpointCommitRequest, Clock, EVENT_SCHEMA_VERSION, IdGenerator, LoopLease,
     LoopStore, RecordedEvent, ResourceBeginHint, ResourceBroker, ResourceError, ResourceHandle,

@@ -709,6 +709,8 @@ dependencies = [
  "loopward-core",
  "loopward-observability",
  "serde",
+ "serde_json",
+ "sha2 0.11.0",
  "thiserror",
  "time",
  "tokio",
