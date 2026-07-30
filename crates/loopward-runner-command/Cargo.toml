@@ -9,3 +9,16 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
+loopward-api = { path = "../loopward-api" }
+loopward-runtime = { path = "../loopward-runtime" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+time = { workspace = true }
+# `fs` and `io-util` are additive on top of the workspace feature set: this
+# adapter is the layer that actually touches the filesystem and drains the
+# spawned process's pipes.
+tokio = { workspace = true, features = ["fs", "io-util"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }

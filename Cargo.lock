@@ -699,6 +699,16 @@ version = "0.1.0"
 [[package]]
 name = "loopward-runner-command"
 version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "loopward-api",
+ "loopward-runtime",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "time",
+ "tokio",
+]
 
 [[package]]
 name = "loopward-runtime"
