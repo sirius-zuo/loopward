@@ -28,6 +28,23 @@ pub enum SessionCloseOutcome {
     Failed,
 }
 
+/// What a rotation does to the generation it rotates out.
+///
+/// This is part of the *event* rather than something [`crate::evolve`]
+/// re-derives from the [`RotationReason`], because the choice depends on the
+/// effective policy at decision time
+/// (`EffectivePolicy::close_session_on_runner_failure`). An event is a fact;
+/// re-deriving it would let the reducer disagree with the decision that
+/// produced it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RotationDisposition {
+    /// Stop admitting work and drain the runner for a structured handoff.
+    Drain,
+    /// The generation cannot be drained and is abandoned; the Episode
+    /// recovers instead.
+    AbandonGeneration,
+}
+
 /// One decided durable lifecycle fact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoopEvent {
@@ -115,6 +132,8 @@ pub enum LoopEvent {
         from_generation: u32,
         /// The primary rotation reason.
         reason: RotationReason,
+        /// What happens to the generation being rotated out.
+        disposition: RotationDisposition,
     },
     /// A Runtime Session generation ended. It is never reopened.
     SessionClosed {

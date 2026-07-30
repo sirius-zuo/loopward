@@ -26,7 +26,7 @@ use loopward_api::runner::SuspensionReason;
 use loopward_api::work_unit::WorkUnitStatus;
 
 use crate::command::LifecycleCommand;
-use crate::event::{LoopEvent, SessionCloseOutcome};
+use crate::event::{LoopEvent, RotationDisposition, SessionCloseOutcome};
 use crate::invariants::{DomainError, Entity};
 use crate::model::{
     AggregateState, AttemptStatus, Checkpoint, Episode, EpisodeKind, EpisodeStatus, LoopStatus,
@@ -128,18 +128,14 @@ pub fn evolve(state: AggregateState, event: &LoopEvent) -> Result<AggregateState
             event,
         ),
         LoopEvent::AttemptStarting { attempt_id } => {
-            let attempt = require_attempt_mut(&mut next, event.kind(), *attempt_id)?;
-            attempt.status = AttemptStatus::Starting;
-            Ok(())
+            apply_attempt_status(&mut next, event, *attempt_id, AttemptStatus::Starting)
         }
         LoopEvent::AttemptStarted {
             attempt_id,
             external_ref,
         } => apply_attempt_started(&mut next, *attempt_id, external_ref),
         LoopEvent::AttemptCollecting { attempt_id } => {
-            let attempt = require_attempt_mut(&mut next, event.kind(), *attempt_id)?;
-            attempt.status = AttemptStatus::Collecting;
-            Ok(())
+            apply_attempt_status(&mut next, event, *attempt_id, AttemptStatus::Collecting)
         }
         LoopEvent::AttemptCompleted {
             attempt_id,
@@ -152,8 +148,11 @@ pub fn evolve(state: AggregateState, event: &LoopEvent) -> Result<AggregateState
             outcome,
         } => apply_verification(&mut next, *attempt_id, *work_unit_id, *outcome, event),
         LoopEvent::RotationRequested {
-            session_id, reason, ..
-        } => apply_rotation_requested(&mut next, *session_id, *reason, event),
+            session_id,
+            reason,
+            disposition,
+            ..
+        } => apply_rotation_requested(&mut next, *session_id, *reason, *disposition, event),
         LoopEvent::SessionClosed {
             session_id,
             outcome,
@@ -222,12 +221,25 @@ fn missing(entity: Entity, command: &'static str) -> DomainError {
 /// before resuming (`docs/06-verification-and-recovery.md` §12); starting a
 /// fresh generation on top of an in-flight external effect would silently
 /// abandon it.
+///
+/// [`AttemptStatus::Ambiguous`] counts as unreconciled even though it is
+/// terminal: it is precisely the state in which Loopward cannot tell whether
+/// the external effect happened, so continuing would risk repeating it. It
+/// is cleared by reconciliation, which is not part of Phase One's command
+/// surface — an ambiguous Attempt therefore halts the Loop rather than
+/// being retried past.
 fn require_reconciled_attempt(state: &AggregateState) -> Result<(), DomainError> {
-    if let Some(attempt) = state.open_attempt() {
+    let unreconciled = state.open_attempt().or_else(|| {
+        state
+            .attempt
+            .as_ref()
+            .filter(|attempt| attempt.status == AttemptStatus::Ambiguous)
+    });
+    if let Some(attempt) = unreconciled {
         return Err(DomainError::InvariantViolation {
             invariant: "attempt.reconciled_before_next_generation",
             detail: format!(
-                "Attempt {} is still `{}` and must be reconciled first",
+                "Attempt {} is `{}` and must be reconciled first",
                 attempt.id,
                 attempt.status.label()
             ),
@@ -423,6 +435,16 @@ fn prepare_attempt(
 
     let mut ordinal = 1;
     if let Some(previous) = &state.attempt {
+        if previous.status == AttemptStatus::Ambiguous {
+            // Never repeat an external effect whose outcome is unknown.
+            return Err(DomainError::InvariantViolation {
+                invariant: "attempt.reconciled_before_next_generation",
+                detail: format!(
+                    "Attempt {} is `ambiguous` and must be reconciled before a retry",
+                    previous.id
+                ),
+            });
+        }
         if !previous.status.is_terminal() {
             return Err(DomainError::InvalidTransition {
                 entity: Entity::Attempt,
@@ -663,17 +685,36 @@ fn request_rotation(
                 to: EpisodeStatus::Recovering.label(),
             });
         }
-        return Ok(vec![
+        let mut events = vec![
             LoopEvent::RotationRequested {
                 session_id: session.id,
                 from_generation: session.generation,
                 reason,
+                disposition: RotationDisposition::AbandonGeneration,
             },
             LoopEvent::SessionClosed {
                 session_id: session.id,
                 outcome: SessionCloseOutcome::Failed,
             },
-        ]);
+        ];
+        // An external effect whose outcome cannot be observed suspends the
+        // Loop: "unsafe unknown side effects produce AMBIGUOUS and suspend
+        // the Loop" (`docs/03-durable-state-and-transactions.md` §4) and
+        // "start outcome uncertain -> reconcile; suspend if ambiguity
+        // remains" (`docs/06-verification-and-recovery.md` §13). Without
+        // this, the next generation could silently retry an external effect
+        // that may already have happened.
+        if state.attempt.as_ref().is_some_and(|attempt| {
+            matches!(
+                attempt.status,
+                AttemptStatus::Starting | AttemptStatus::Running
+            )
+        }) {
+            events.push(LoopEvent::LoopSuspended {
+                reason: SuspensionReason::Recovery,
+            });
+        }
+        return Ok(events);
     }
 
     if session.status != SessionStatus::Running {
@@ -694,6 +735,7 @@ fn request_rotation(
         session_id: session.id,
         from_generation: session.generation,
         reason,
+        disposition: RotationDisposition::Drain,
     }])
 }
 
@@ -988,6 +1030,16 @@ fn apply_attempt_prepared(
     Ok(())
 }
 
+fn apply_attempt_status(
+    state: &mut AggregateState,
+    event: &LoopEvent,
+    attempt_id: loopward_api::ids::AttemptId,
+    status: AttemptStatus,
+) -> Result<(), DomainError> {
+    require_attempt_mut(state, event.kind(), attempt_id)?.status = status;
+    Ok(())
+}
+
 fn apply_attempt_started(
     state: &mut AggregateState,
     attempt_id: loopward_api::ids::AttemptId,
@@ -1045,9 +1097,10 @@ fn apply_rotation_requested(
     state: &mut AggregateState,
     session_id: SessionId,
     reason: RotationReason,
+    disposition: RotationDisposition,
     event: &LoopEvent,
 ) -> Result<(), DomainError> {
-    let failing = reason.is_runner_failure();
+    let failing = disposition == RotationDisposition::AbandonGeneration;
     match state.session.as_mut() {
         Some(session) if session.id == session_id => {
             session.rotation_intent = Some(reason);

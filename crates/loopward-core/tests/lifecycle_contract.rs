@@ -17,8 +17,8 @@ use loopward_api::work_unit::{
 use loopward_core::{
     AggregateState, AttemptStatus, Checkpoint, DomainError, EffectivePolicy, Entity, Episode,
     EpisodeKind, EpisodeStatus, LifecycleCommand, LoopEvent, LoopExecution, LoopKind, LoopStatus,
-    RotationReason, RuntimeSession, SessionStatus, SideEffectClass, VerificationOutcome,
-    WorkUnitAttempt, decide, evolve, validate_invariants,
+    RotationReason, RuntimeSession, SessionReusePolicy, SessionStatus, SideEffectClass,
+    VerificationOutcome, WorkUnitAttempt, decide, evolve, validate_invariants,
 };
 
 // ---------------------------------------------------------------------------
@@ -49,6 +49,7 @@ struct StateBuilder {
     loop_status: LoopStatus,
     checkpoint_version: u64,
     episode: Option<EpisodeStatus>,
+    uncheckpointed_episode: bool,
     session: Option<(SessionId, SessionStatus, u32)>,
     work_unit: Option<WorkUnitStatus>,
     attempt: Option<(AttemptId, AttemptStatus)>,
@@ -63,6 +64,7 @@ impl StateBuilder {
             loop_status: LoopStatus::Active,
             checkpoint_version: 1,
             episode: None,
+            uncheckpointed_episode: false,
             session: None,
             work_unit: None,
             attempt: None,
@@ -76,6 +78,14 @@ impl StateBuilder {
 
     fn episode(mut self, status: EpisodeStatus) -> Self {
         self.episode = Some(status);
+        self
+    }
+
+    /// Leaves a terminal Episode without its committed Checkpoint, the state
+    /// a Loop is in between `Fail`/`Suspend` and the final
+    /// `CommitCheckpoint`.
+    fn uncheckpointed_episode(mut self) -> Self {
+        self.uncheckpointed_episode = true;
         self
     }
 
@@ -101,7 +111,8 @@ impl StateBuilder {
             kind: EpisodeKind::Execution,
             status,
             base_checkpoint_version: self.checkpoint_version,
-            terminal_checkpoint_version: status.is_terminal().then_some(self.checkpoint_version),
+            terminal_checkpoint_version: (status.is_terminal() && !self.uncheckpointed_episode)
+                .then_some(self.checkpoint_version),
             active_session: self
                 .session
                 .as_ref()
@@ -921,24 +932,125 @@ fn the_command_surface_produces_exactly_these_documented_edges() {
     );
 }
 
+/// A terminal Loop may still record the Checkpoint its terminal Episode owes
+/// — and nothing else.
+///
+/// `docs/07-session-rotation.md` §3 requires every terminal Episode state to
+/// produce a committed Checkpoint, and `docs/06-verification-and-recovery.md`
+/// §14 lists terminal completion or failure as a thing a Checkpoint may
+/// represent. `Fail` and `Suspend` are exactly the paths that terminate an
+/// Episode without one, so the final commit has to be admissible after the
+/// Loop is already terminal. That is a *record* of the terminal state, not an
+/// advance past it (`docs/02-core-domain-model.md` §2), and it is bounded to
+/// happen at most once: the commit stamps `terminal_checkpoint_version`, and
+/// no further Episode can ever start on a terminal Loop.
 #[test]
-fn terminal_states_refuse_every_command() {
+fn terminal_loop_records_its_final_checkpoint_exactly_once() {
     let policy = EffectivePolicy::default();
+    let state = StateBuilder::new()
+        .loop_status(LoopStatus::Failed)
+        .episode(EpisodeStatus::Aborted)
+        .uncheckpointed_episode()
+        .session(SessionStatus::Failed, 1)
+        .build();
+    assert_eq!(
+        state
+            .episode
+            .as_ref()
+            .expect("episode present")
+            .terminal_checkpoint_version,
+        None
+    );
 
-    // A terminal Loop refuses everything that would advance it.
+    let events = decide(
+        &state,
+        &LifecycleCommand::CommitCheckpoint {
+            checkpoint: next_checkpoint(&state),
+        },
+        &policy,
+    )
+    .expect("a terminal Episode still owes its Checkpoint");
+    let state = apply_all(state, &events);
+
+    assert_eq!(state.execution.status, LoopStatus::Failed);
+    assert_eq!(state.execution.checkpoint_version, 2);
+    assert_eq!(
+        state
+            .episode
+            .as_ref()
+            .expect("episode present")
+            .terminal_checkpoint_version,
+        Some(2)
+    );
+
+    // Once recorded, it cannot be recorded again: the Loop is now fully
+    // drained and can advance no further by any route.
+    let error = decide(
+        &state,
+        &LifecycleCommand::CommitCheckpoint {
+            checkpoint: next_checkpoint(&state),
+        },
+        &policy,
+    )
+    .expect_err("a checkpointed terminal Episode cannot commit twice");
+    assert!(
+        matches!(
+            error,
+            DomainError::InvalidTransition {
+                entity: Entity::Episode,
+                from: "aborted",
+                ..
+            }
+        ),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
+fn terminal_loop_refuses_every_command_but_its_final_checkpoint() {
+    let policy = EffectivePolicy::default();
     for status in LoopStatus::ALL.iter().filter(|status| status.is_terminal()) {
-        let state = StateBuilder::new().loop_status(*status).build();
+        // A fixture with real children present, so a command is refused by
+        // the Loop gate rather than merely dying on a missing entity.
+        let state = StateBuilder::new()
+            .loop_status(*status)
+            .episode(EpisodeStatus::Aborted)
+            .uncheckpointed_episode()
+            .session(SessionStatus::Failed, 1)
+            .work_unit(WorkUnitStatus::Failed)
+            .attempt(AttemptStatus::Cancelled)
+            .build();
+
         for command in command_catalogue(&state) {
-            let Ok(events) = decide(&state, &command, &policy) else {
+            let outcome = decide(&state, &command, &policy);
+            if matches!(command, LifecycleCommand::CommitCheckpoint { .. }) {
+                outcome.expect("the terminal Episode's own Checkpoint is admissible");
                 continue;
-            };
-            panic!(
-                "terminal Loop `{}` accepted `{}`: {events:?}",
+            }
+            let error = outcome.expect_err(&format!(
+                "terminal Loop `{}` accepted `{}`",
+                status.label(),
+                command.name()
+            ));
+            assert!(
+                matches!(
+                    error,
+                    DomainError::InvalidTransition {
+                        entity: Entity::Loop,
+                        ..
+                    }
+                ),
+                "terminal Loop `{}` refused `{}` for the wrong reason: {error:?}",
                 status.label(),
                 command.name()
             );
         }
     }
+}
+
+#[test]
+fn terminal_sessions_and_attempts_are_never_resurrected() {
+    let policy = EffectivePolicy::default();
 
     // A closed or failed Session generation is never reopened, whatever the
     // command.
@@ -1025,4 +1137,354 @@ fn only_an_accepting_verification_outcome_accepts_a_work_unit() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Ambiguity, fencing, and policy coverage
+// ---------------------------------------------------------------------------
+
+/// An external effect whose outcome cannot be observed must halt the Loop.
+///
+/// `docs/03-durable-state-and-transactions.md` §4: "Unsafe unknown side
+/// effects produce `AMBIGUOUS` and suspend the Loop."
+/// `docs/06-verification-and-recovery.md` §13: "Start outcome uncertain →
+/// Reconcile; suspend if ambiguity remains." Retrying past an ambiguous
+/// Attempt could repeat an external effect that already happened.
+#[test]
+fn an_ambiguous_attempt_suspends_the_loop_and_blocks_retry() {
+    let policy = EffectivePolicy::default();
+    let state = StateBuilder::new()
+        .episode(EpisodeStatus::Executing)
+        .session(SessionStatus::Running, 1)
+        .work_unit(WorkUnitStatus::Active)
+        .attempt(AttemptStatus::Running)
+        .build();
+
+    let events = decide(
+        &state,
+        &LifecycleCommand::RequestRotation {
+            reason: RotationReason::RunnerFailure,
+        },
+        &policy,
+    )
+    .expect("a runner failure always forces the generation closed");
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, LoopEvent::LoopSuspended { .. })),
+        "an in-flight Attempt lost to runner failure must suspend the Loop: {events:?}"
+    );
+    let state = apply_all(state, &events);
+
+    assert_eq!(
+        state.attempt.as_ref().expect("attempt present").status,
+        AttemptStatus::Ambiguous,
+        "an unobservable external effect is ambiguous, not failed"
+    );
+    assert_eq!(
+        state.session.as_ref().expect("session present").status,
+        SessionStatus::Failed
+    );
+    assert_eq!(state.execution.status, LoopStatus::Suspended);
+
+    // The suspended Loop refuses the whole recovery-and-retry sequence the
+    // runtime would otherwise walk straight through.
+    for command in [
+        LifecycleCommand::MarkHydrated {
+            manifest: resource("resource://boot/manifest-2"),
+        },
+        LifecycleCommand::StartSession {
+            session_id: SessionId::new(),
+            generation: 2,
+        },
+        LifecycleCommand::PrepareAttempt {
+            attempt_id: AttemptId::new(),
+            idempotency_key: "attempt-2".to_owned(),
+        },
+    ] {
+        let error =
+            decide(&state, &command, &policy).expect_err("a suspended Loop admits no further work");
+        assert!(
+            matches!(
+                error,
+                DomainError::InvalidTransition {
+                    entity: Entity::Loop,
+                    ..
+                }
+            ),
+            "`{}` was refused for the wrong reason: {error:?}",
+            command.name()
+        );
+    }
+}
+
+/// Even on an Active Loop — the state a future `Resume` command would
+/// restore — an unreconciled ambiguous Attempt blocks the next generation
+/// and any retry.
+#[test]
+fn an_ambiguous_attempt_is_unreconciled_even_though_it_is_terminal() {
+    let policy = EffectivePolicy::default();
+
+    let hydrating = StateBuilder::new()
+        .episode(EpisodeStatus::Hydrating)
+        .session(SessionStatus::Failed, 1)
+        .work_unit(WorkUnitStatus::Active)
+        .attempt(AttemptStatus::Ambiguous)
+        .build();
+    let error = decide(
+        &hydrating,
+        &LifecycleCommand::StartSession {
+            session_id: SessionId::new(),
+            generation: 2,
+        },
+        &policy,
+    )
+    .expect_err("the next generation must not start over an ambiguous effect");
+    assert!(
+        matches!(
+            error,
+            DomainError::InvariantViolation {
+                invariant: "attempt.reconciled_before_next_generation",
+                ..
+            }
+        ),
+        "unexpected error: {error:?}"
+    );
+
+    let executing = StateBuilder::new()
+        .episode(EpisodeStatus::Executing)
+        .session(SessionStatus::Running, 1)
+        .work_unit(WorkUnitStatus::Active)
+        .attempt(AttemptStatus::Ambiguous)
+        .build();
+    let error = decide(
+        &executing,
+        &LifecycleCommand::PrepareAttempt {
+            attempt_id: AttemptId::new(),
+            idempotency_key: "attempt-2".to_owned(),
+        },
+        &policy,
+    )
+    .expect_err("an ambiguous external effect must not be repeated");
+    assert!(
+        matches!(
+            error,
+            DomainError::InvariantViolation {
+                invariant: "attempt.reconciled_before_next_generation",
+                ..
+            }
+        ),
+        "unexpected error: {error:?}"
+    );
+}
+
+/// Every Checkpoint commit is fenced: monotonic version, exact expected
+/// aggregate revision, parent linkage, and Loop identity
+/// (`docs/03-durable-state-and-transactions.md` §2, §5, §10).
+#[test]
+fn checkpoint_commit_is_fenced_on_version_revision_parent_and_identity() {
+    let policy = EffectivePolicy::default();
+    let state = StateBuilder::new()
+        .episode(EpisodeStatus::Draining)
+        .session(SessionStatus::Draining, 1)
+        .build();
+    let committed = state.checkpoint.version;
+    let revision = state.execution.aggregate_revision;
+
+    let commit = |checkpoint: Checkpoint| {
+        decide(
+            &state,
+            &LifecycleCommand::CommitCheckpoint { checkpoint },
+            &policy,
+        )
+    };
+
+    // Non-monotonic version: re-committing the current version, and going
+    // backwards, are both refused.
+    for proposed in [committed, committed - 1] {
+        let error = commit(Checkpoint {
+            version: proposed,
+            ..next_checkpoint(&state)
+        })
+        .expect_err("checkpoint versions increase monotonically");
+        assert_eq!(
+            error,
+            DomainError::NonMonotonicCheckpoint {
+                committed,
+                proposed
+            }
+        );
+    }
+
+    // Stale or fabricated expected revision: the optimistic-concurrency
+    // check every durable write is fenced against.
+    for found in [revision - 1, revision + 1] {
+        let error = commit(Checkpoint {
+            aggregate_revision: found,
+            ..next_checkpoint(&state)
+        })
+        .expect_err("a commit must carry the exact expected aggregate revision");
+        assert_eq!(
+            error,
+            DomainError::RevisionConflict {
+                expected: revision,
+                found
+            }
+        );
+    }
+
+    // Parent linkage: a Checkpoint must continue the committed one.
+    for parent in [None, Some(CheckpointId::new())] {
+        let error = commit(Checkpoint {
+            parent,
+            ..next_checkpoint(&state)
+        })
+        .expect_err("a Checkpoint must link to the Checkpoint it continues");
+        assert!(
+            matches!(
+                error,
+                DomainError::InvariantViolation {
+                    invariant: "checkpoint.parent_links_to_committed",
+                    ..
+                }
+            ),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    // Identity: another Loop's Checkpoint is never accepted here.
+    let error = commit(Checkpoint {
+        loop_id: LoopId::new(),
+        ..next_checkpoint(&state)
+    })
+    .expect_err("a Checkpoint belongs to exactly one Loop");
+    assert!(
+        matches!(
+            error,
+            DomainError::IdentityMismatch {
+                entity: Entity::Checkpoint,
+                ..
+            }
+        ),
+        "unexpected error: {error:?}"
+    );
+
+    // The conforming commit is accepted and advances both counters.
+    let events = commit(next_checkpoint(&state)).expect("a fenced, conforming commit is accepted");
+    let after = apply_all(state.clone(), &events);
+    assert_eq!(after.execution.checkpoint_version, committed + 1);
+    assert!(after.execution.aggregate_revision > revision);
+}
+
+/// `session_reuse` and `max_attempts_per_work_unit` are real gates, not
+/// decoration (`docs/07-session-rotation.md` §8,
+/// `docs/06-verification-and-recovery.md` §10).
+#[test]
+fn policy_bounds_session_reuse_and_retry_count() {
+    let state = StateBuilder::new()
+        .episode(EpisodeStatus::Executing)
+        .session(SessionStatus::Running, 1)
+        .work_unit(WorkUnitStatus::Pending)
+        .attempt(AttemptStatus::Failed)
+        .build();
+    let retry = LifecycleCommand::PrepareAttempt {
+        attempt_id: AttemptId::new(),
+        idempotency_key: "attempt-2".to_owned(),
+    };
+
+    // Phase One's default: a fresh Runtime Session for each Work Unit, so
+    // the generation that already ran an Attempt cannot run another.
+    let error = decide(&state, &retry, &EffectivePolicy::default())
+        .expect_err("the default policy requires rotation between Attempts");
+    assert!(
+        matches!(
+            error,
+            DomainError::PolicyViolation {
+                policy: "session.fresh_per_work_unit",
+                ..
+            }
+        ),
+        "unexpected error: {error:?}"
+    );
+
+    // Opting into reuse honors it, and the attempt budget still binds.
+    let reuse = EffectivePolicy {
+        session_reuse: SessionReusePolicy::AllowReuse,
+        max_attempts_per_work_unit: Some(2),
+        ..EffectivePolicy::default()
+    };
+    let events = decide(&state, &retry, &reuse).expect("reuse is opt-in but honored");
+    let after = apply_all(state.clone(), &events);
+    let attempt = after.attempt.as_ref().expect("attempt present");
+    assert_eq!(attempt.ordinal, 2, "a retry gets the next ordinal");
+    assert_eq!(attempt.status, AttemptStatus::Prepared);
+
+    let bounded = EffectivePolicy {
+        max_attempts_per_work_unit: Some(1),
+        ..reuse
+    };
+    let error =
+        decide(&state, &retry, &bounded).expect_err("remediation is bounded by the attempt budget");
+    assert!(
+        matches!(
+            error,
+            DomainError::PolicyViolation {
+                policy: "work_unit.max_attempts",
+                ..
+            }
+        ),
+        "unexpected error: {error:?}"
+    );
+}
+
+/// `close_session_on_runner_failure` selects between mandatory closure and
+/// an ordinary drain (`docs/07-session-rotation.md` §8).
+#[test]
+fn policy_selects_mandatory_closure_or_drain_on_runner_failure() {
+    let build = || {
+        StateBuilder::new()
+            .episode(EpisodeStatus::Executing)
+            .session(SessionStatus::Running, 1)
+            .work_unit(WorkUnitStatus::Active)
+            .attempt(AttemptStatus::Running)
+            .build()
+    };
+    let rotate = LifecycleCommand::RequestRotation {
+        reason: RotationReason::RunnerFailure,
+    };
+
+    let state = build();
+    let events =
+        decide(&state, &rotate, &EffectivePolicy::default()).expect("closure is mandatory");
+    let closed = apply_all(state, &events);
+    assert_eq!(
+        closed.session.as_ref().expect("session present").status,
+        SessionStatus::Failed
+    );
+    assert_eq!(
+        closed.episode.as_ref().expect("episode present").status,
+        EpisodeStatus::Suspended,
+        "the recovering Episode is then suspended by the ambiguity"
+    );
+
+    let lenient = EffectivePolicy {
+        close_session_on_runner_failure: false,
+        ..EffectivePolicy::default()
+    };
+    let state = build();
+    let events = decide(&state, &rotate, &lenient).expect("an ordinary drain is attempted instead");
+    let drained = apply_all(state, &events);
+    assert_eq!(
+        drained.session.as_ref().expect("session present").status,
+        SessionStatus::Draining
+    );
+    assert_eq!(
+        drained.episode.as_ref().expect("episode present").status,
+        EpisodeStatus::Draining
+    );
+    assert_eq!(drained.execution.status, LoopStatus::Active);
+    assert_eq!(
+        drained.attempt.as_ref().expect("attempt present").status,
+        AttemptStatus::Running
+    );
 }

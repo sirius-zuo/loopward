@@ -97,7 +97,7 @@ pub mod policy;
 pub mod reducer;
 
 pub use command::LifecycleCommand;
-pub use event::{LoopEvent, SessionCloseOutcome};
+pub use event::{LoopEvent, RotationDisposition, SessionCloseOutcome};
 pub use invariants::{DomainError, Entity, validate_invariants};
 pub use model::{
     AggregateState, AttemptStatus, Checkpoint, ContextBudget, Episode, EpisodeKind, EpisodeStatus,
