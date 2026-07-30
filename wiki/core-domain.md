@@ -196,6 +196,9 @@ Implementation has not been assessed.
 
 - [Public API](public-api.md)
 - [Runtime Lifecycle](runtime-lifecycle.md)
+- [Context Management](context-management.md)
 - [Work Unit Execution](work-unit-execution.md)
 - [Durable State](durable-state.md)
 - [Verification and Recovery](verification-recovery.md)
+- [Observability](observability.md)
+- [CLI and Testkit](cli-and-testkit.md)

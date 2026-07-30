@@ -33,15 +33,15 @@ graph BT
 
 | Page | Covers | Summary |
 |---|---|---|
-| [Public API](public-api.md) | loopward-api | Stable service, runner, DTO, versioning, and security contracts. |
-| [Core Domain](core-domain.md) | loopward-core | Durable entities, invariants, and pure lifecycle transitions. |
-| [Runtime Lifecycle](runtime-lifecycle.md) | loopward-runtime | Controller, Episode, Session, rotation, budget, and continuation behavior. |
-| [Context Management](context-management.md) | runtime context subsystem | Hydration, Boot Packages, resources, compaction, and context budgets. |
-| [Work Unit Execution](work-unit-execution.md) | runner boundaries | Work Units, Attempts, runner protocol, external effects, and cancellation. |
-| [Durable State](durable-state.md) | loopward-store-sqlite | Transactions, Checkpoints, journal, leases, fencing, and recovery. |
-| [Verification and Recovery](verification-recovery.md) | runtime verification and recovery | Gates, remediation, completion, reconciliation, and no-progress handling. |
-| [Observability](observability.md) | observability crates | Trace contracts, OTLP adapter, propagation, metrics, and degradation. |
-| [CLI and Testkit](cli-and-testkit.md) | composition and evaluation | Operator commands, conformance tests, failure injection, and evaluation scenarios. |
+| [Public API](public-api.md) | loopward-api | Versioned inbound lifecycle and outbound runner contracts that preserve authority boundaries. |
+| [Core Domain](core-domain.md) | loopward-core | Durable domain state, lifecycle invariants, and pure transitions independent of sessions and adapters. |
+| [Runtime Lifecycle](runtime-lifecycle.md) | loopward-runtime | Bounded advancement from one committed Checkpoint to the next safe durable boundary. |
+| [Context Management](context-management.md) | runtime context subsystem | Deterministic construction of bounded, auditable Boot Packages for replaceable Runtime Sessions. |
+| [Work Unit Execution](work-unit-execution.md) | runner boundaries | Durable, externally observable execution whose results remain untrusted until verified and committed. |
+| [Durable State](durable-state.md) | loopward-store-sqlite | Authoritative SQLite state, immutable Checkpoints, lifecycle events, concurrency control, and recovery. |
+| [Verification and Recovery](verification-recovery.md) | runtime verification and recovery | Evidence-bound acceptance and safe recovery from interrupted or ambiguous external work. |
+| [Observability](observability.md) | observability crates | Best-effort lifecycle traces and runner correlation that remain outside authoritative state. |
+| [CLI and Testkit](cli-and-testkit.md) | composition and evaluation | Operator composition and deterministic conformance tooling without an alternative lifecycle engine. |
 
 ## Maintenance Convention
 
