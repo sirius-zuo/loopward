@@ -58,7 +58,9 @@ contributors to make no-op doc edits. Run the materialized `check-wiki.sh`
 
 Copy [TEMPLATE.md](TEMPLATE.md) for new pages: nine sections in order;
 Mermaid-only diagrams; no line numbers (function/type/file names only);
-links target only canonical page filenames; every Key Decision cites a real
-PR number or commit SHA; known debt appears only under Implementation
-Notes. Target 150–350 lines per page; if a draft exceeds ~400 lines it is
-over-scoped.
+links target only canonical page filenames; every Key Decision cites either
+a durable tracked specification or design-document path with a named section
+for spec-first pages, or a real PR number or commit SHA when repository
+history applies—never invent an identifier or rationale; known debt appears
+only under Implementation Notes. Target 150–350 lines per page; if a draft
+exceeds ~400 lines it is over-scoped.

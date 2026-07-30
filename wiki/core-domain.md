@@ -37,6 +37,7 @@ classDiagram
     }
     class RuntimeSession {
         +SessionId id
+        +LoopId loop_id
         +EpisodeId episode_id
         +u32 generation
         +SessionStatus status
