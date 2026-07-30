@@ -2,7 +2,7 @@
 
 ## Purpose
 
-The CLI and testkit make Loopward operable and measurable without creating an alternative lifecycle engine. `loopward-cli` is the Phase One composition root and a local operator client of the public `LoopService`; every command crosses the same versioned, idempotent, concurrency-aware boundary available to other clients. `loopward-testkit` supplies deterministic clocks, scripted runners, in-memory ports, trace recording, fixtures, and failure injection for conformance tests. Together they prove bounded execution, recovery, context carry, and trace continuity while keeping real-runner comparisons explicitly separate from deterministic correctness claims.
+The CLI and testkit make Loopward operable and measurable without creating an alternative lifecycle engine. `loopward-cli` is the Phase One composition root: normal lifecycle commands use the public `LoopService`, while inspection and integrity commands use a separate authorization-controlled administrative boundary. Mutating lifecycle requests are versioned, idempotent, and concurrency-aware. `loopward-testkit` supplies deterministic clocks, scripted runners, in-memory ports, trace recording, fixtures, and failure injection for conformance tests. Together they prove bounded execution, recovery, context carry, and trace continuity while keeping real-runner comparisons explicitly separate from deterministic correctness claims.
 
 ## Position in the System
 
@@ -84,7 +84,7 @@ Comparative evaluation uses the command runner rather than testkit fakes. It can
 1. **Compose the application and execute a finite operator command.**
    1. `loopward-cli` resolves storage, resource, run, lease, runner-profile, and tracing configuration.
    2. It constructs the SQLite store, command runner, runtime service, and either no-op telemetry or the optional OpenTelemetry adapter.
-   3. The selected subcommand builds a versioned public request with request identity, idempotency key, expected revision where applicable, and trace context.
+   3. For a mutating lifecycle command, the selected subcommand builds a versioned public request with request identity, idempotency key, expected revision where applicable, and trace context; read-only and administrative operations do not construct lifecycle idempotency keys.
    4. `advance` asks `LoopService` to reach one safe durable boundary; `run` supplies a finite limit and is rejected as `InvalidRequest` when none is present.
    5. The CLI renders a concise operator result or a versioned JSON DTO. It never bypasses runtime validation to mutate Checkpoints, Events, leases, or lifecycle state.
 
