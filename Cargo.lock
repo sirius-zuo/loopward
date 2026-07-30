@@ -111,6 +111,11 @@ version = "0.1.0"
 [[package]]
 name = "loopward-core"
 version = "0.1.0"
+dependencies = [
+ "loopward-api",
+ "serde",
+ "thiserror",
+]
 
 [[package]]
 name = "loopward-observability"

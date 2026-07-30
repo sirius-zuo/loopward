@@ -9,3 +9,6 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+loopward-api = { path = "../loopward-api" }
+serde = { workspace = true }
+thiserror = { workspace = true }
