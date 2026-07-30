@@ -168,6 +168,15 @@ fn session(
     }
 }
 
+/// The `checkpoint.committed` journal event every Checkpoint commit must
+/// record (`docs/03-durable-state-and-transactions.md` §5; the port
+/// documents `events` as recording "at minimum `checkpoint.committed`").
+fn records_commit(checkpoint: &Checkpoint) -> Vec<LoopEvent> {
+    vec![LoopEvent::CheckpointCommitted {
+        checkpoint: checkpoint.clone(),
+    }]
+}
+
 /// A projection sitting at `checkpoint` whose Episode is executing and
 /// whose Runtime Session boots from `manifest`.
 fn state_with_session(
@@ -481,6 +490,109 @@ async fn commit_checkpoint_rejects_stale_fencing_tokens_and_versions() {
         .await
         .expect("a well-fenced commit succeeds");
     assert_eq!(committed.state.execution.checkpoint_version, 2);
+}
+
+#[tokio::test]
+async fn a_commit_must_journal_the_checkpoint_committed_event() {
+    let harness = Harness::open().await;
+    let loop_id = LoopId::new();
+    let genesis = commit_genesis(&harness, loop_id).await;
+
+    // §5 lists `checkpoint.committed` among the commit transaction's
+    // mandated contents, and the port documents `events` as recording "at
+    // minimum `checkpoint.committed`". A commit carrying no events at all
+    // would publish a durable Checkpoint whose commit appears nowhere in
+    // the journal while the revision advanced regardless.
+    let next = checkpoint_at(loop_id, 2, 2, Some(genesis.id));
+    let no_events = harness
+        .store
+        .commit_checkpoint(CheckpointCommitRequest {
+            loop_id,
+            expected_revision: 1,
+            expected_checkpoint_version: 1,
+            fencing_token: 0,
+            checkpoint: next.clone(),
+            events: vec![],
+            state: genesis_state(loop_id, next.clone()),
+        })
+        .await
+        .expect_err("a commit journalling no events is rejected");
+    assert!(matches!(
+        backend_error(&no_events),
+        SqliteStoreError::MissingCheckpointCommittedEvent { .. }
+    ));
+
+    // Events that are not `checkpoint.committed` do not satisfy the rule
+    // either.
+    let wrong_event = harness
+        .store
+        .commit_checkpoint(CheckpointCommitRequest {
+            loop_id,
+            expected_revision: 1,
+            expected_checkpoint_version: 1,
+            fencing_token: 0,
+            checkpoint: next.clone(),
+            events: vec![LoopEvent::LoopCompleted],
+            state: genesis_state(loop_id, next.clone()),
+        })
+        .await
+        .expect_err("an unrelated event does not record the commit");
+    assert!(matches!(
+        backend_error(&wrong_event),
+        SqliteStoreError::MissingCheckpointCommittedEvent { .. }
+    ));
+
+    // Nor does a `checkpoint.committed` naming a *different* Checkpoint.
+    let other = checkpoint_at(loop_id, 2, 2, Some(genesis.id));
+    let wrong_checkpoint = harness
+        .store
+        .commit_checkpoint(CheckpointCommitRequest {
+            loop_id,
+            expected_revision: 1,
+            expected_checkpoint_version: 1,
+            fencing_token: 0,
+            checkpoint: next.clone(),
+            events: records_commit(&other),
+            state: genesis_state(loop_id, next.clone()),
+        })
+        .await
+        .expect_err("a checkpoint.committed naming another checkpoint is rejected");
+    assert!(matches!(
+        backend_error(&wrong_checkpoint),
+        SqliteStoreError::MissingCheckpointCommittedEvent { .. }
+    ));
+
+    // None of the three rejections left a trace.
+    assert_eq!(
+        harness
+            .count(
+                "SELECT COUNT(*) FROM checkpoints WHERE loop_id = ?1",
+                loop_id
+            )
+            .await,
+        1
+    );
+    assert_eq!(harness.event_sequences(loop_id).await, vec![1]);
+
+    // The same commit, properly journalled, succeeds.
+    let committed = harness
+        .store
+        .commit_checkpoint(CheckpointCommitRequest {
+            loop_id,
+            expected_revision: 1,
+            expected_checkpoint_version: 1,
+            fencing_token: 0,
+            events: records_commit(&next),
+            checkpoint: next.clone(),
+            state: genesis_state(loop_id, next.clone()),
+        })
+        .await
+        .expect("a commit that records itself succeeds");
+    assert_eq!(committed.state.execution.checkpoint_version, 2);
+    assert_eq!(
+        committed.events.last().expect("journal is non-empty").event,
+        LoopEvent::CheckpointCommitted { checkpoint: next }
+    );
 }
 
 #[tokio::test]
@@ -1045,7 +1157,7 @@ async fn one_loop_has_at_most_one_active_episode() {
             expected_checkpoint_version: 1,
             fencing_token: 0,
             checkpoint: second.clone(),
-            events: vec![],
+            events: records_commit(&second),
             state,
         })
         .await
@@ -1064,8 +1176,8 @@ async fn one_loop_has_at_most_one_active_episode() {
             expected_revision: 2,
             expected_checkpoint_version: 2,
             fencing_token: 0,
+            events: records_commit(&third),
             checkpoint: third,
-            events: vec![],
             state,
         })
         .await
@@ -1095,7 +1207,7 @@ async fn closed_sessions_cannot_reopen() {
             expected_checkpoint_version: 1,
             fencing_token: 0,
             checkpoint: second.clone(),
-            events: vec![],
+            events: records_commit(&second),
             state: state_with_session(
                 loop_id,
                 second.clone(),
@@ -1125,8 +1237,8 @@ async fn closed_sessions_cannot_reopen() {
             expected_revision: 2,
             expected_checkpoint_version: 2,
             fencing_token: 0,
+            events: records_commit(&third),
             checkpoint: third,
-            events: vec![],
             state: reopened,
         })
         .await

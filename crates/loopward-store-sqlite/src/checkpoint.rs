@@ -19,8 +19,8 @@
 
 use loopward_api::ids::{EpisodeId, LoopId, Timestamp};
 use loopward_core::{
-    AggregateState, Checkpoint, Episode, EpisodeStatus, RuntimeSession, SessionStatus, WorkUnit,
-    WorkUnitAttempt, work_unit_status_label,
+    AggregateState, Checkpoint, Episode, EpisodeStatus, LoopEvent, RuntimeSession, SessionStatus,
+    WorkUnit, WorkUnitAttempt, work_unit_status_label,
 };
 use loopward_runtime::ports::{CheckpointCommitRequest, StoreError, StoredLoop};
 use sha2::{Digest, Sha256};
@@ -175,12 +175,31 @@ fn validated_state(request: &CheckpointCommitRequest) -> Result<AggregateState, 
         });
     }
 
+    // §5 lists the `checkpoint.committed` journal event among the commit
+    // transaction's mandated contents, and the port documents `events` as
+    // recording "at minimum `checkpoint.committed`". Without it the commit
+    // would advance the revision and publish a durable Checkpoint whose
+    // commit appears nowhere in the journal.
+    let records_this_commit = request.events.iter().any(|event| {
+        matches!(
+            event,
+            LoopEvent::CheckpointCommitted { checkpoint: recorded }
+                if recorded.id == checkpoint.id
+        )
+    });
+    if !records_this_commit {
+        return Err(SqliteStoreError::MissingCheckpointCommittedEvent {
+            loop_id,
+            checkpoint_id: checkpoint.id,
+        });
+    }
+
     // A Checkpoint commit is itself a durable lifecycle transition, so the
-    // revision must advance past the expected one even when the commit
-    // journals no events of its own (§2).
+    // revision must advance by at least the events this commit journals —
+    // which, per the check above, is never fewer than one (§2).
     let events = request.events.len();
     let required = request.expected_revision
-        + u64::try_from(events.max(1))
+        + u64::try_from(events)
             .map_err(|_| SqliteStoreError::integer_range("event count", &events))?;
     if state.execution.aggregate_revision < required {
         return Err(SqliteStoreError::NonMonotonicAggregateRevision {

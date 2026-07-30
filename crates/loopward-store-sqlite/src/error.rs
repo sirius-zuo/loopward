@@ -18,7 +18,7 @@
 //! { /* ... */ }
 //! ```
 
-use loopward_api::ids::{EpisodeId, LoopId, SessionId};
+use loopward_api::ids::{CheckpointId, EpisodeId, LoopId, SessionId};
 use loopward_runtime::ports::{ResourceError, StoreError};
 
 /// A failure of the `SQLite`/filesystem backend, or of a storage invariant
@@ -121,6 +121,28 @@ pub enum SqliteStoreError {
         expected_checkpoint_version: u64,
         /// The version of the Checkpoint being committed.
         given: u64,
+    },
+
+    /// A Checkpoint commit did not journal the `checkpoint.committed` event
+    /// that records it.
+    ///
+    /// `docs/03-durable-state-and-transactions.md` §5 lists the
+    /// `checkpoint.committed` journal event among the commit transaction's
+    /// mandated contents, and the port documents
+    /// [`CheckpointCommitRequest::events`] as recording "at minimum
+    /// `checkpoint.committed`". Accepting a commit without it would leave a
+    /// durable Checkpoint whose commit appears nowhere in the journal, while
+    /// the projection's revision advanced anyway.
+    ///
+    /// [`CheckpointCommitRequest::events`]: loopward_runtime::ports::CheckpointCommitRequest::events
+    #[error(
+        "checkpoint commit for {loop_id} must journal a checkpoint.committed event naming checkpoint {checkpoint_id}"
+    )]
+    MissingCheckpointCommittedEvent {
+        /// The Loop the commit targeted.
+        loop_id: LoopId,
+        /// The Checkpoint the journal event had to name.
+        checkpoint_id: CheckpointId,
     },
 
     /// A write did not advance the aggregate revision far enough to cover
