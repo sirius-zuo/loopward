@@ -112,32 +112,28 @@ The error surface uses stable `LoopwardErrorCode` values with a sanitized messag
 ### Keep public operations finite and observable
 
 - **Decision:** `advance` ends at the next safe durable boundary, `run_until` requires an explicit finite limit, and longer work returns an `OperationHandle`.
-- **Context:** A durable Loop may outlive any caller request or Runtime Session, so a public call cannot safely imply an unbounded coordinator session.
-- **Alternatives rejected:** Concealing permanent or unlimited execution behind one service call is rejected because clients need explicit bounds, cancellation, status, and event observation.
+- **Rationale:** No PR or design doc records a rationale; observed current state: public calls do not conceal unbounded work, `run_until` requires at least one finite limit, and long operations return an `OperationHandle`.
 - **Consequences:** Clients choose bounded progress and monitor operations through status or cursor-based events; at least one `RunLimits` bound is mandatory.
 - **Ref:** `docs/09-public-api.md` (sections 2–4: Inbound Loop Service, Finite Operations, Command Metadata).
 
 ### Treat runner output as proposals
 
 - **Decision:** `WorkUnitResult` may propose state, observations, decisions, evidence, and continuation, but only Loopward validation and verification can accept them.
-- **Context:** Runner implementations may be agents, commands, services, human processes, or other frameworks and are outside lifecycle authority.
-- **Alternatives rejected:** Allowing a runner to commit a Checkpoint, activate a decision, satisfy criteria, or declare completion is rejected because it bypasses durable transition and verification gates.
+- **Rationale:** No PR or design doc records a rationale; observed current state: `WorkUnitResult` cannot commit a Checkpoint, activate a decision, mark an acceptance criterion satisfied, or declare the Loop complete.
 - **Consequences:** External execution remains replaceable, and runner completion stays distinct from result validation, verification, acceptance, Work Unit completion, and Loop completion.
 - **Ref:** `docs/05-work-unit-and-runner-protocol.md` (section 7: Work Unit Result); `docs/02-core-domain-model.md` (sections 8 and 10: Observation and Decision; Acceptance and Verification).
 
 ### Version contracts independently
 
 - **Decision:** Service protocol, Checkpoint schema, Work Unit protocol, Boot Package manifest, durable events, and domain state schema have independent versions.
-- **Context:** These contracts evolve at different rates and cross process or persistence boundaries.
-- **Alternatives rejected:** One implicit implementation version is rejected because it would couple unrelated compatibility surfaces and obscure migrations.
+- **Rationale:** No PR or design doc records a rationale; observed current state: the specification independently versions the service protocol, Checkpoint schema, Work Unit request/result protocol, Boot Package manifest, durable event schema, and domain state schema.
 - **Consequences:** A Loop records versions at creation and migration, while callers and runners negotiate explicit protocol versions and receive typed `UnsupportedVersion` errors.
 - **Ref:** `docs/09-public-api.md` (sections 10–11: Error Model; Versioning); `docs/schemas/checkpoint-v0.1.yaml` (field: `schema_version`); `docs/schemas/event-v0.1.yaml` (field: `schema_version`); `docs/schemas/work-unit-v0.1.yaml` (field: `schema_version`); `docs/schemas/work-unit-result-v0.1.yaml` (field: `schema_version`); `docs/schemas/boot-package-manifest-v0.1.yaml` (field: `schema_version`).
 
 ### Preserve state ownership across wrappers
 
 - **Decision:** Cross-system execution references are opaque, and wrappers translate only public outcomes, control signals, and trace context.
-- **Context:** Loopward may invoke an external system as a Work Unit or be invoked by one as a worker.
-- **Alternatives rejected:** Copying internal state machines or introducing orchestration concepts into Loopward Core is rejected because each framework must remain authoritative for its own lifecycle.
+- **Rationale:** No PR or design doc records a rationale; observed current state: each framework owns its authoritative state, cross-system execution references are opaque, wrappers map public outcomes and control signals without copying internal state machines, and Aether is excluded from Phase One.
 - **Consequences:** External integrations can work in either direction without store access or topology leakage; Aether remains a possible future example, not a Phase One dependency.
 - **Ref:** `docs/09-public-api.md` (section 13: Wrapper Integration); `docs/10-mvp-and-evaluation.md` (sections 3–4: Phase One Scope; Excluded Scope).
 
@@ -160,11 +156,12 @@ Implementation has not been assessed.
 
 ### Specification Sources
 
+- `docs/00-project-charter.md` (sections 3 and 7: Goals; Technology Baseline)
 - `docs/01-system-architecture.md` (sections 2–4: Workspace Layout; Crate Responsibilities; Dependency Rules)
 - `docs/02-core-domain-model.md` (sections 2–10: LoopExecution through Acceptance and Verification)
 - `docs/05-work-unit-and-runner-protocol.md` (sections 4–7 and 11–14: Runner Contract through Work Unit Result; Cancellation and Suspension through Acceptance Criteria)
 - `docs/09-public-api.md` (sections 1–14: Purpose through Acceptance Criteria)
-- `docs/10-mvp-and-evaluation.md` (sections 3, 11, and 13: Phase One Scope; CLI Surface; Phase One Acceptance Criteria)
+- `docs/10-mvp-and-evaluation.md` (sections 3–4, 11, and 13: Phase One Scope; Excluded Scope; CLI Surface; Phase One Acceptance Criteria)
 - `docs/schemas/boot-package-manifest-v0.1.yaml` (field: schema_version; Boot Package manifest contract)
 - `docs/schemas/checkpoint-v0.1.yaml` (field: schema_version; Checkpoint schema contract)
 - `docs/schemas/event-v0.1.yaml` (field: schema_version; durable event schema contract)
