@@ -14,77 +14,36 @@ The [Core Domain](core-domain.md) defines the versioned `Checkpoint`, aggregate 
 
 ## Architecture
 
-The diagram shows the specified persistence model and write guards; it is not an implementation inventory.
+The diagram is a conceptual view of the specified storage model and atomic write
+sets. Arrows show participation or reference relationships, not exact database
+cardinality or a physical schema.
 
 ```mermaid
-classDiagram
-    class LoopProjection {
-        +LoopId loop_id
-        +u64 aggregate_revision
-        +u64 checkpoint_version
-        +LoopStatus status
-        +Optional~EpisodeId~ active_episode
-        +Optional~WorkUnitId~ active_work_unit
-    }
-    class Checkpoint {
-        +CheckpointIdentity identity
-        +KernelState kernel
-        +GoalState goal
-        +PinnedState pinned
-        +WorkState work
-        +ObservationSet observations
-        +DecisionSet decisions
-        +DomainState domain
-        +ResourceSet resources
-        +VerificationState verification
-        +Continuation continuation
-        +IntegrityRecord integrity
-    }
-    class LoopEvent {
-        +EventId event_id
-        +u64 journal_position
-        +LoopId loop_id
-        +u64 aggregate_revision
-        +String schema_version
-        +Timestamp occurred_at
-        +Timestamp recorded_at
-        +EventType type
-        +Correlation correlation
-        +Digest payload_digest
-    }
-    class LoopLease {
-        +LoopId loop_id
-        +RuntimeInstanceId holder_id
-        +u64 fencing_token
-        +Timestamp acquired_at
-        +Timestamp expires_at
-    }
-    class WorkUnitAttempt {
-        +AttemptId id
-        +String idempotency_key
-        +AttemptStatus status
-        +Optional~OpaqueRef~ external_execution_ref
-        +RunnerCapabilities capabilities_snapshot
-        +Optional~ResourceRef~ result_ref
-    }
-    class VerificationRun {
-        +VerificationPlanRef plan
-        +Digest target_digest
-        +VerificationState state
-    }
-    class ResourceMetadata {
-        +ResourceRef reference
-        +Digest digest
-        +ResourceState state
-    }
+flowchart TD
+    model["Specified storage model"]
+    projections["Current projections"]
+    checkpoints["Immutable Checkpoints"]
+    journal["Append-only lifecycle Event Journal"]
+    tables["Specified SQLite tables"]
+    commit["Checkpoint commit transaction"]
+    intent["Attempt prepare transaction"]
+    observation["Attempt observation transaction"]
+    guards["Expected aggregate revision + lease fencing token"]
 
-    LoopProjection "1" --> "0..*" Checkpoint : current version selects
-    LoopProjection "1" --> "0..*" LoopEvent : lifecycle journal
-    LoopProjection "1" --> "0..1" LoopLease : fenced by
-    LoopProjection "1" --> "0..*" WorkUnitAttempt : projects
-    Checkpoint --> VerificationRun : records
-    Checkpoint --> ResourceMetadata : references finalized
-    WorkUnitAttempt --> LoopEvent : emits durable transitions
+    model --> projections
+    model --> checkpoints
+    model --> journal
+    model --> tables
+    guards --> commit
+    guards --> intent
+    guards --> observation
+    commit --> checkpoints
+    commit --> projections
+    commit --> journal
+    intent --> tables
+    intent --> journal
+    observation --> tables
+    observation --> journal
 ```
 
 The current projection is the query-efficient view of the Loop's latest lifecycle state. `aggregate_revision` increments on every durable lifecycle transition, while `checkpoint_version` increments only when an authoritative Checkpoint is committed. Every write supplies an expected aggregate revision and the current lease fencing token. A stale revision loses an optimistic-concurrency race; a stale fencing token cannot write even if its former holder resumes.
@@ -148,9 +107,9 @@ The specified crash outcomes are:
 ### Use SQLite for the Phase One durable store
 
 - **Decision:** `loopward-store-sqlite` provides Phase One transactions, projections, immutable Checkpoints, journal, leases, fencing, migrations, and resource metadata.
-- **Rationale:** No PR or design doc records a rationale; observed current state: the project charter sets SQLite as the durable-store technology baseline and the architecture assigns these storage responsibilities to the SQLite adapter.
-- **Consequences:** The store uses WAL mode, foreign-key enforcement, a configured busy timeout, `synchronous = NORMAL` by default, and transactional migrations; deployments that require greater durability may select `synchronous = FULL`.
-- **Ref:** `docs/01-system-architecture.md` (section 3: Crate Responsibilities); `docs/03-durable-state-and-transactions.md` (sections 3 and 8: SQLite Tables; SQLite Configuration).
+- **Rationale:** No PR or design doc records a rationale; observed current state: the storage model combines current projections, immutable Checkpoints, and an append-only lifecycle Event Journal, and the architecture assigns durable storage responsibilities to `loopward-store-sqlite`.
+- **Consequences:** Phase One has a concrete adapter for the specified projections, immutable Checkpoints, lifecycle journal, transactions, leases and fencing, migrations, and resource metadata.
+- **Ref:** `docs/01-system-architecture.md` (section 3: Crate Responsibilities); `docs/03-durable-state-and-transactions.md` (section 1: Storage Model).
 
 ### Keep Checkpoint versions immutable
 
@@ -186,7 +145,7 @@ The specified crash outcomes are:
 - **Invariant:** Checkpoint versions, aggregate revisions, and committed per-Loop event positions increase monotonically.
 - **Invariant:** Event sequence is gap-free per committed transaction, and journal entries remain transactionally consistent with projection changes.
 - **Invariant:** At most one driver may mutate a Loop, and a stale fencing token cannot write.
-- **Invariant:** At most one Episode and one Work Unit are active per Loop in Phase One.
+- **Invariant:** At most one Episode is active per Loop in Phase One.
 - **Invariant:** Closed Sessions cannot reopen.
 - **Invariant:** Unfinalized resources cannot enter a Checkpoint; evidence resources must be immutable, version-addressed, or content-addressed.
 - **Invariant:** Runner results and proposed decisions are not authoritative until validation, verification, and the applicable decision or Checkpoint gate accepts them.
