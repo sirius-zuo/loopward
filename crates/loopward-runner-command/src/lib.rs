@@ -67,6 +67,23 @@ pub const DEFAULT_MAX_CAPTURE_BYTES: u64 = 1024 * 1024;
 /// waiting for a force kill to take effect.
 pub const DEFAULT_CANCELLATION_GRACE: Duration = Duration::from_secs(5);
 
+/// The default capture drain grace period (2 seconds).
+///
+/// A pipe reaches end-of-file only when *every* holder of its write end
+/// closes it, so a command that backgrounds a longer-lived grandchild leaves
+/// the inherited descriptors open after the command itself is reaped.
+/// Draining is therefore bounded: once the command exits, capture is given
+/// this long to finish before it is abandoned and the run's outcome is
+/// published with whatever was captured. Ordinary commands close their pipes
+/// as they exit and finish this instantly.
+pub const DEFAULT_CAPTURE_DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// The default program used to deliver cooperative termination (`kill`).
+///
+/// Resolved through `PATH`. See
+/// [`CommandRunnerConfig::cooperative_stop_program`].
+pub const DEFAULT_COOPERATIVE_STOP_PROGRAM: &str = "kill";
+
 /// How a [`CommandRunner`] invokes and bounds its command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandRunnerConfig {
@@ -83,6 +100,20 @@ pub struct CommandRunnerConfig {
     /// How long cancellation waits for cooperative termination before
     /// escalating, and then for the escalation to take effect.
     pub cancellation_grace: Duration,
+    /// How long capture may keep draining after the command itself has
+    /// exited, before it is abandoned so the run's outcome can be published.
+    pub capture_drain_grace: Duration,
+    /// The program invoked to deliver cooperative termination, given
+    /// `-TERM <pid>`.
+    ///
+    /// `tokio::process::Child` exposes only an unconditional kill, and
+    /// signalling through `libc` would require `unsafe`, which this workspace
+    /// forbids — so a `SIGTERM` is delivered by running this program. If it
+    /// cannot be invoked (for example on a minimal image with no `kill(1)` on
+    /// `PATH`), cancellation escalates to an unconditional kill and reports
+    /// [`TerminationObservation::ForceKilled`] rather than claiming a
+    /// cooperative exit that never happened.
+    pub cooperative_stop_program: PathBuf,
     /// The request/result protocol versions this runner accepts. Only the
     /// namespace and major component participate in compatibility.
     pub accepted_protocol_versions: Vec<String>,
@@ -99,6 +130,8 @@ impl CommandRunnerConfig {
             max_result_bytes: DEFAULT_MAX_RESULT_BYTES,
             max_capture_bytes: DEFAULT_MAX_CAPTURE_BYTES,
             cancellation_grace: DEFAULT_CANCELLATION_GRACE,
+            capture_drain_grace: DEFAULT_CAPTURE_DRAIN_GRACE,
+            cooperative_stop_program: PathBuf::from(DEFAULT_COOPERATIVE_STOP_PROGRAM),
             accepted_protocol_versions: vec![loopward_api::PROTOCOL_VERSION.to_owned()],
         }
     }
@@ -132,6 +165,20 @@ impl CommandRunnerConfig {
     #[must_use]
     pub fn with_cancellation_grace(mut self, cancellation_grace: Duration) -> Self {
         self.cancellation_grace = cancellation_grace;
+        self
+    }
+
+    /// Sets how long capture may keep draining after the command exits.
+    #[must_use]
+    pub fn with_capture_drain_grace(mut self, capture_drain_grace: Duration) -> Self {
+        self.capture_drain_grace = capture_drain_grace;
+        self
+    }
+
+    /// Sets the program used to deliver cooperative termination.
+    #[must_use]
+    pub fn with_cooperative_stop_program(mut self, program: impl Into<PathBuf>) -> Self {
+        self.cooperative_stop_program = program.into();
         self
     }
 
@@ -391,6 +438,8 @@ impl WorkUnitRunner for CommandRunner {
             layout,
             environment,
             max_capture_bytes: self.config.max_capture_bytes,
+            capture_drain_grace: self.config.capture_drain_grace,
+            cooperative_stop_program: self.config.cooperative_stop_program.clone(),
         })
         .map_err(|err| {
             runner_error(

@@ -233,8 +233,21 @@ async fn wait_for_log_marker(path: &Path, marker: &str) {
 }
 
 /// A config whose `run_root` lives inside the test's temp directory.
+///
+/// The capture drain grace is deliberately shortened from the production
+/// default so no test's runtime depends on it. This matters more than it
+/// looks: on macOS there is no `pipe2`, so the standard library creates a
+/// pipe and *then* sets `FD_CLOEXEC`, and a concurrent `fork` in another
+/// thread can capture the write end before that second step lands. A suite
+/// that spawns many processes at once therefore occasionally leaks a write
+/// end into an unrelated child, and the affected run's pipe never reaches
+/// end-of-file. Bounding the drain is exactly what keeps that survivable;
+/// bounding it *briefly* keeps the suite fast. Nothing is truncated by the
+/// short grace — the command's bytes are already in the pipe buffer and read
+/// before the wait for end-of-file begins.
 fn config_in(dir: &tempfile::TempDir, program: PathBuf) -> CommandRunnerConfig {
     CommandRunnerConfig::new(program, dir.path().join("runs"))
+        .with_capture_drain_grace(Duration::from_millis(250))
 }
 
 // ---------------------------------------------------------------------------
@@ -613,6 +626,147 @@ async fn cancel_force_kills_and_reports_it_when_the_grace_period_expires() {
     );
     let status = runner.status(&handle).await.expect("status succeeds");
     assert_eq!(status.state, RunState::Cancelled);
+}
+
+#[tokio::test]
+async fn cancel_reports_a_force_kill_when_cooperative_termination_cannot_be_delivered() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let broker = Arc::new(InMemoryResourceBroker::default());
+    // `slow.sh` honours SIGTERM, but the program that would deliver it does
+    // not exist — the same situation as a minimal image with no `kill(1)` on
+    // PATH, and the situation on every non-Unix target. The process is killed
+    // outright, so it must not be reported as a cooperative exit.
+    let config = config_in(&dir, fixture("slow.sh"))
+        .with_cooperative_stop_program("loopward-no-such-cooperative-stop-program")
+        .with_cancellation_grace(Duration::from_secs(5));
+    let runner = CommandRunner::new(config, broker);
+
+    let attempt_id = AttemptId::new();
+    let handle = runner
+        .start(sample_request(attempt_id))
+        .await
+        .expect("start succeeds");
+    wait_for_log_marker(
+        &runner
+            .attempt_dir(attempt_id)
+            .join(protocol::STDOUT_LOG_FILE_NAME),
+        "slow runner started",
+    )
+    .await;
+
+    runner
+        .cancel(&handle, CancellationReason::OperatorRequest)
+        .await
+        .expect("cancel succeeds");
+
+    assert_eq!(
+        runner.termination_observation(&handle),
+        Some(TerminationObservation::ForceKilled),
+        "an undeliverable cooperative stop escalates to a kill and must be reported as one"
+    );
+    let status = runner.status(&handle).await.expect("status succeeds");
+    assert_eq!(status.state, RunState::Cancelled);
+    assert!(
+        status
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("force-killed")),
+        "status must not claim a cooperative exit that never happened, got: {:?}",
+        status.detail
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Orphaned pipe holders
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn collect_does_not_hang_when_a_grandchild_still_holds_the_output_pipe() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let broker = Arc::new(InMemoryResourceBroker::default());
+    // The fixture backgrounds a 10-second pipe holder and exits immediately.
+    // With a 200 ms drain grace, the outcome must be published on the
+    // command's own exit rather than on the orphan's.
+    let config = config_in(&dir, fixture("orphan-pipe.sh"))
+        .with_capture_drain_grace(Duration::from_millis(200));
+    let runner = CommandRunner::new(config, broker);
+
+    let attempt_id = AttemptId::new();
+    let handle = runner
+        .start(sample_request(attempt_id))
+        .await
+        .expect("start succeeds");
+
+    let result = tokio::time::timeout(Duration::from_secs(5), runner.collect(&handle))
+        .await
+        .expect("collect must not block on the orphaned pipe holder")
+        .expect("collect succeeds");
+    assert_eq!(result.attempt_id, attempt_id);
+    assert_eq!(result.outcome, WorkUnitOutcome::Produced);
+
+    // Whatever the command wrote before exiting is still captured and
+    // finalized, even though the capture tasks were abandoned.
+    let status = tokio::time::timeout(Duration::from_secs(5), runner.status(&handle))
+        .await
+        .expect("status must not block on the orphaned pipe holder")
+        .expect("status succeeds");
+    assert_eq!(status.state, RunState::Completed);
+
+    let stdout_log = std::fs::read_to_string(
+        runner
+            .attempt_dir(attempt_id)
+            .join(protocol::STDOUT_LOG_FILE_NAME),
+    )
+    .expect("stdout.log is captured");
+    assert!(
+        stdout_log.contains("orphan-pipe runner started"),
+        "abandoning capture must not discard what was already captured, got: {stdout_log:?}"
+    );
+}
+
+#[tokio::test]
+async fn cancel_is_not_misreported_when_a_grandchild_still_holds_the_output_pipe() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let broker = Arc::new(InMemoryResourceBroker::default());
+    let config = config_in(&dir, fixture("orphan-pipe.sh"))
+        .with_capture_drain_grace(Duration::from_millis(200))
+        .with_cancellation_grace(Duration::from_secs(5));
+    let runner = CommandRunner::new(config, broker);
+
+    let attempt_id = AttemptId::new();
+    let handle = runner
+        .start(sample_request(attempt_id))
+        .await
+        .expect("start succeeds");
+    // The command exits on its own almost immediately; the orphan lives on.
+    wait_for_log_marker(
+        &runner
+            .attempt_dir(attempt_id)
+            .join(protocol::STDOUT_LOG_FILE_NAME),
+        "orphan-pipe runner started",
+    )
+    .await;
+
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        runner.cancel(&handle, CancellationReason::OperatorRequest),
+    )
+    .await
+    .expect("cancel must not block on the orphaned pipe holder")
+    .expect("cancel succeeds");
+
+    assert_ne!(
+        runner.termination_observation(&handle),
+        Some(TerminationObservation::StillRunning),
+        "a reaped command must never be reported as possibly still running just because \
+         an orphan holds its pipe"
+    );
+    let status = runner.status(&handle).await.expect("status succeeds");
+    assert_eq!(
+        status.state,
+        RunState::Cancelled,
+        "the command's terminal state is known, so the run is not ambiguous"
+    );
 }
 
 // ---------------------------------------------------------------------------
