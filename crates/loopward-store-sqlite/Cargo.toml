@@ -9,3 +9,22 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
+loopward-api = { path = "../loopward-api" }
+loopward-core = { path = "../loopward-core" }
+loopward-runtime = { path = "../loopward-runtime" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+# `macros` is enabled only for `sqlx::migrate!`, which embeds the files in
+# `migrations/` at compile time. Every query in this crate is a dynamic
+# `sqlx::query`, never a compile-time-checked `query!`, so building never
+# requires a live database.
+sqlx = { workspace = true, features = ["macros"] }
+thiserror = { workspace = true }
+time = { workspace = true, features = ["parsing"] }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true }
