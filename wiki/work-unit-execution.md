@@ -164,7 +164,7 @@ The `ResourceBroker` stages runner output and returns a `ResourceRef` only after
    2. It supplies Loop, Episode, Session, generation, Work Unit, Attempt, request, result, and resource identifiers through the specified `LOOPWARD_*` environment variables and propagates `TRACEPARENT` and `TRACESTATE`.
    3. The configured local process executes without direct Store access and writes resources and the structured result to the designated paths.
    4. The adapter captures stdout and stderr, performs bounded interruption when requested, and validates the result before returning it as `WorkUnitResult`.
-   5. Vendor-specific agent behavior remains outside `loopward-core`; different command profiles must satisfy the same public fixture.
+   5. Vendor-specific agent behavior remains outside `loopward-core`; a command, agent, remote service, or wrapper can implement the same public runner contract.
 
 ## Key Decisions
 
