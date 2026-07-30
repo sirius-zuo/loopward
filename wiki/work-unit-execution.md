@@ -14,6 +14,8 @@ The [Runtime Lifecycle](runtime-lifecycle.md) `WorkUnitManager` validates Work U
 
 ## Architecture
 
+The following class diagram is schematic: it shows the specified boundary types and their cardinalities, not implementation code.
+
 ```mermaid
 classDiagram
     class WorkUnit {
@@ -21,7 +23,8 @@ classDiagram
         +WorkUnitKind kind
         +String objective
         +WorkUnitStatus status
-        +ResourceRef inputs
+        +List~ResourceRef~ inputs
+        +List~ConstraintRef~ constraints
         +OutputContract output_contract
         +VerificationPlanRef verification_plan
         +RunnerRef runner
@@ -56,36 +59,40 @@ classDiagram
         +EpisodeId episode_id
         +SessionId session_id
         +u32 session_generation
+        +WorkUnit work_unit
         +AttemptId attempt_id
         +String idempotency_key
         +BootPackageManifest boot_package
-        +ResourceGrant resource_grants
+        +List~ResourceGrant~ resource_grants
         +OutputContract output_contract
         +ResourceBudget budget
-        +Timestamp deadline
+        +Optional~Timestamp~ deadline
         +TraceContext trace_context
     }
     class WorkUnitResult {
         +String protocol_version
         +AttemptId attempt_id
         +WorkUnitOutcome outcome
-        +ResourceRef outputs
-        +StateAssertionProposal state_proposals
-        +ObservationProposal observation_proposals
-        +DecisionProposal decision_proposals
-        +ResourceRef verification_evidence
-        +OpenIssueProposal unresolved
-        +ContinuationProposal recommended_continuation
+        +List~ResourceRef~ outputs
+        +List~StateAssertionProposal~ state_proposals
+        +List~ObservationProposal~ observation_proposals
+        +List~DecisionProposal~ decision_proposals
+        +List~ResourceRef~ verification_evidence
+        +List~OpenIssueProposal~ unresolved
+        +Optional~ContinuationProposal~ recommended_continuation
         +UsageReport usage
-        +TraceRef runner_trace_refs
+        +List~TraceRef~ runner_trace_refs
     }
     class RunnerCapabilities {
-        +String protocol_versions
+        +List~String~ protocol_versions
         +bool resumable
         +bool supports_reconcile
         +bool supports_events
         +bool supports_suspend
         +bool supports_cancel
+        +bool reports_token_usage
+        +bool reports_internal_trace_context
+        +ContextCapabilities context
     }
     class ResourceBroker {
         +begin(ResourceMetadata)
@@ -218,8 +225,6 @@ The `ResourceBroker` stages runner output and returns a `ResourceRef` only after
 - **Phase One constraint:** One Loop has at most one active Work Unit; concurrent execution and scheduling are outside scope.
 - **Phase One adapter:** `loopward-runner-command` uses structured request and result files, resource directories, identifier environment variables, trace propagation, stdout/stderr capture, and bounded interruption.
 - **Failure model:** `ProtocolError`, `UnsupportedCapability`, `AuthenticationError`, `AuthorizationError`, `ResourceError`, `Unavailable`, `Timeout`, `ExecutionFailed`, `Cancelled`, `AmbiguousExternalState`, and `InvalidResult` remain distinct typed outcomes.
-- **Evaluation requirement:** Failure injection covers the boundaries before runner start, after external start but before handle persistence, during execution, and after result materialization; each case has an expected reconciliation outcome.
-- **Evaluation requirement:** At least two command-runner profiles complete the same Work Unit protocol fixture without adding vendor concepts to Core.
 
 ## Spec Deviations
 
