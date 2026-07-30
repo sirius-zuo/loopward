@@ -9,3 +9,14 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
+loopward-api = { path = "../loopward-api" }
+loopward-core = { path = "../loopward-core" }
+loopward-observability = { path = "../loopward-observability" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
