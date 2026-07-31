@@ -1258,3 +1258,91 @@ fn a_blocking_required_finding_bars_completion_even_with_a_satisfied_criterion()
         "no blocking finding may remain unresolved at completion"
     );
 }
+
+#[test]
+fn a_historical_blocking_finding_with_no_current_replacement_still_bars_completion() {
+    // A criterion-less required gate (a final integrity check, say) failed
+    // once at an earlier Checkpoint and was never re-run at the current one.
+    // Unlike a criterion-carrying finding, there is no criterion to check for
+    // a current pass against — but the same gate never ran again either, so
+    // this historical failure must still block completion rather than being
+    // silently forgiven.
+    let outputs = vec![output_ref("resource://output/1", RESULT_BODY)];
+    let digest = target_for(&outputs, 1).binding_digest();
+    let findings = vec![
+        finding(
+            "criterion-001-gate",
+            GateOutcome::Passed,
+            GateEnforcement::Required,
+            Some("criterion-001"),
+            &digest,
+            7,
+        ),
+        finding(
+            "final-integrity",
+            GateOutcome::Failed,
+            GateEnforcement::Required,
+            None,
+            &digest,
+            6,
+        ),
+    ];
+
+    let assessment = assess_completion(&checkpoint(7), &findings);
+    assert!(
+        !assessment.permitted,
+        "a criterion-less required gate with no current finding at all must still block completion"
+    );
+    assert!(
+        assessment.obstacles.iter().any(|obstacle| matches!(
+            obstacle,
+            CompletionObstacle::BlockingFinding { gate_id, .. }
+                if *gate_id == GateId::new("final-integrity")
+        )),
+        "obstacles: {:?}",
+        assessment.obstacles
+    );
+}
+
+#[test]
+fn a_historical_blocking_finding_is_forgiven_once_its_gate_has_a_current_passing_finding() {
+    // The same criterion-less gate that failed historically has since run
+    // again and passed at the current Checkpoint version. The stale failure
+    // must not linger as a permanent obstacle once its own gate has spoken
+    // for itself at the current Checkpoint.
+    let outputs = vec![output_ref("resource://output/1", RESULT_BODY)];
+    let digest = target_for(&outputs, 1).binding_digest();
+    let findings = vec![
+        finding(
+            "criterion-001-gate",
+            GateOutcome::Passed,
+            GateEnforcement::Required,
+            Some("criterion-001"),
+            &digest,
+            7,
+        ),
+        finding(
+            "final-integrity",
+            GateOutcome::Failed,
+            GateEnforcement::Required,
+            None,
+            &digest,
+            6,
+        ),
+        finding(
+            "final-integrity",
+            GateOutcome::Passed,
+            GateEnforcement::Required,
+            None,
+            &digest,
+            7,
+        ),
+    ];
+
+    let assessment = assess_completion(&checkpoint(7), &findings);
+    assert!(
+        assessment.permitted,
+        "obstacles: {:?}",
+        assessment.obstacles
+    );
+}

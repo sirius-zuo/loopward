@@ -430,17 +430,19 @@ pub struct CompletionAssessment {
 /// [`VerificationRun::findings`] accumulates: every prior run's findings,
 /// carried forward and marked [`GateOutcome::Stale`] once superseded, plus
 /// every fresh one. That accumulation must never make completion *less*
-/// stable over time — a criterion a *current* finding already satisfies stays
-/// satisfied no matter how many stale or out-of-date findings for the same
-/// criterion the Loop produced on the way there. Concretely: a finding that
-/// is not current (its Checkpoint version predates `checkpoint.version`, or
-/// its target has moved and it was marked [`GateOutcome::Stale`]) is inert
-/// whenever a current finding already speaks for that criterion — it can
-/// neither satisfy it nor block it. It becomes an obstacle only when it is
-/// the *sole* evidence the criterion has ever had. A current finding that
-/// failed, in contrast, always blocks its criterion outright: live evidence
-/// is never overridden by older evidence, and a live failure is never
-/// averaged away by some other gate's pass.
+/// stable over time — a criterion (or, for a criterion-less required gate
+/// such as a final integrity check, a `gate_id`) that a *current* finding
+/// already satisfies stays satisfied no matter how many stale or
+/// out-of-date findings for the same criterion or gate the Loop produced on
+/// the way there. Concretely: a finding that is not current (its Checkpoint
+/// version predates `checkpoint.version`, or its target has moved and it was
+/// marked [`GateOutcome::Stale`]) is inert whenever a current finding already
+/// speaks for the same criterion (or, lacking a criterion, the same
+/// `gate_id`) — it can neither satisfy it nor block it. It becomes an
+/// obstacle only when it is the *sole* evidence that criterion or gate has
+/// ever had. A current finding that failed, in contrast, always blocks
+/// outright: live evidence is never overridden by older evidence, and a live
+/// failure is never averaged away by some other gate's pass.
 ///
 /// Advisory findings are never obstacles (`docs/06` §7). Absence of evidence
 /// is: a Loop with no required findings at all is not complete, it is
@@ -472,6 +474,15 @@ pub fn assess_completion(
     let mut passing: BTreeSet<CriterionId> = BTreeSet::new();
     let mut current_gaps: BTreeMap<CriterionId, EvidenceGap> = BTreeMap::new();
     let mut historical_gaps: BTreeMap<CriterionId, EvidenceGap> = BTreeMap::new();
+    // A criterion-less required gate (a final integrity check, say) has no
+    // `CriterionId` to key on, so it is tracked by `gate_id` instead — the
+    // same current/historical forgiveness rule applies, just keyed
+    // differently. `current_gate_ids` records every `gate_id` that has *any*
+    // current finding at all (passing or not), so a historical, criterion-
+    // less finding for that same gate can tell whether it has actually been
+    // superseded by something current, rather than assuming so.
+    let mut current_gate_ids: BTreeSet<GateId> = BTreeSet::new();
+    let mut historical_gate_gaps: BTreeMap<GateId, (EvidenceGap, String)> = BTreeMap::new();
     let mut supported = false;
 
     for finding in findings
@@ -490,11 +501,12 @@ pub fn assess_completion(
         // in force, and not superseded by a moved target. Anything else is
         // historical — evidence from a point the Loop has since moved past
         // — and historical evidence must never permanently block a
-        // criterion that a current finding already satisfies.
+        // criterion (or gate) that a current finding already satisfies.
         let is_current = finding.lineage.checkpoint_version == checkpoint.version
             && finding.outcome != GateOutcome::Stale;
 
         if is_current {
+            current_gate_ids.insert(finding.gate_id.clone());
             if finding.outcome == GateOutcome::Passed {
                 supported = true;
                 if let Some(criterion) = finding.criterion.clone() {
@@ -517,16 +529,25 @@ pub fn assess_completion(
         }
 
         // Historical: has no bearing on completion unless it turns out to be
-        // the only evidence its criterion ever had.
-        if let Some(criterion) = finding.criterion.clone() {
-            let gap = if finding.lineage.checkpoint_version == checkpoint.version {
-                // Version matches, so `is_current` was false only because
-                // the target moved out from under this finding.
-                EvidenceGap::Stale
-            } else {
-                EvidenceGap::NotCurrent
-            };
-            historical_gaps.entry(criterion).or_insert(gap);
+        // the only evidence its criterion (or, lacking one, its gate) ever
+        // had — decided after the loop, once every current finding has been
+        // seen.
+        let gap = if finding.lineage.checkpoint_version == checkpoint.version {
+            // Version matches, so `is_current` was false only because the
+            // target moved out from under this finding.
+            EvidenceGap::Stale
+        } else {
+            EvidenceGap::NotCurrent
+        };
+        match finding.criterion.clone() {
+            Some(criterion) => {
+                historical_gaps.entry(criterion).or_insert(gap);
+            }
+            None => {
+                historical_gate_gaps
+                    .entry(finding.gate_id.clone())
+                    .or_insert_with(|| (gap, finding.code.clone()));
+            }
         }
     }
 
@@ -549,6 +570,16 @@ pub fn assess_completion(
             continue;
         }
         obstacles.push(CompletionObstacle::CriterionUnsupported { criterion, gap });
+    }
+
+    // Same forgiveness rule for a criterion-less required gate, keyed by
+    // `gate_id` instead of criterion: historical evidence blocks only when
+    // that exact gate has never produced a current finding at all.
+    for (gate_id, (gap, code)) in historical_gate_gaps {
+        if current_gate_ids.contains(&gate_id) {
+            continue;
+        }
+        obstacles.push(CompletionObstacle::BlockingFinding { gate_id, code, gap });
     }
 
     if !supported {
