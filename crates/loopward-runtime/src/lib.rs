@@ -13,6 +13,7 @@
 
 pub mod context;
 pub mod ports;
+pub mod verification;
 
 pub use context::{ContextHydrator, HydrationError, HydrationReport, HydrationRequest};
 pub use ports::{
@@ -20,3 +21,4 @@ pub use ports::{
     LoopStore, RecordedEvent, ResourceBeginHint, ResourceBroker, ResourceError, ResourceHandle,
     RuntimeInstanceId, RuntimePorts, StoreError, StoredLoop,
 };
+pub use verification::{VerificationEngine, VerificationFinding};

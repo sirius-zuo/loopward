@@ -18,7 +18,9 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
-uuid = { workspace = true }
-
-[dev-dependencies]
+# Scoped to the deterministic verification gate, which runs a configured
+# check command (a test suite, a linter, a checksum) against a Work Unit's
+# output. This is verification's own narrow use of subprocess execution, not
+# a `WorkUnitRunner`: launching a Work Unit Attempt remains an adapter's job.
 tokio = { workspace = true }
+uuid = { workspace = true }

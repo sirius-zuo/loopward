@@ -74,6 +74,10 @@ pub use budget::{REFERENCE_ONLY_TOKENS, available_boot_tokens, heuristic_token_e
 pub use hydrator::SelectionBucket;
 pub use manifest::{BOOT_PACKAGE_MANIFEST_SCHEMA_VERSION, checkpoint_ref_for};
 
+/// The one `SHA-256` helper the crate shares, so a verification target
+/// binding and a Boot Package manifest are digested the same way.
+pub(crate) use manifest::content_digest;
+
 /// One item considered for a Boot Package, before payload materialization.
 ///
 /// This is the hydrator's input form of [`loopward_api::context::ContextItem`]:
