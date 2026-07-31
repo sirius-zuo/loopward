@@ -24,7 +24,7 @@ use loopward_api::ids::{
 use loopward_api::loop_service::LoopKind;
 use loopward_api::resource::{PhaseRef, ResourceRef};
 use loopward_api::work_unit::ResourceBudget;
-use loopward_core::{AggregateState, Checkpoint, LoopEvent, LoopExecution, LoopStatus};
+use loopward_core::{AggregateState, Checkpoint, LoopEvent, LoopExecution, LoopStatus, evolve};
 use loopward_observability::NoopTelemetrySink;
 use loopward_runtime::ports::{
     AcquireLease, CheckpointCommitRequest, Clock, EVENT_SCHEMA_VERSION, IdGenerator, LoopLease,
@@ -273,17 +273,28 @@ impl LoopStore for InMemoryLoopStore {
             });
         }
 
+        // Fold each event through the same `evolve` its caller already
+        // validated it against with `decide`, mirroring what
+        // `commit_checkpoint` below does with its caller-supplied `state`.
+        // A fake that only bumped `aggregate_revision` here would silently
+        // round-trip `episode`/`session`/`work_unit`/`attempt` unchanged
+        // between two `append` calls with no intervening Checkpoint commit
+        // — exactly the gap a real `SqliteLoopStore` had until this same
+        // fix was applied there.
+        let mut state = stored.state.clone();
         for event in events {
-            stored.state.execution.aggregate_revision += 1;
+            state = evolve(state, &event)
+                .expect("fake store: event must apply to the state it was decided against");
             stored.events.push(RecordedEvent {
                 event_id: self.event_ids.new_event_id(),
                 sequence: stored.events.len() as u64 + 1,
-                aggregate_revision: stored.state.execution.aggregate_revision,
+                aggregate_revision: state.execution.aggregate_revision,
                 schema_version: EVENT_SCHEMA_VERSION.to_owned(),
                 recorded_at: Timestamp::UNIX_EPOCH,
                 event,
             });
         }
+        stored.state = state;
         Ok(stored.clone())
     }
 
@@ -371,6 +382,22 @@ impl LoopStore for InMemoryLoopStore {
     }
 
     async fn acquire_lease(&self, request: AcquireLease) -> Result<LoopLease, StoreError> {
+        // A real store's `loop_leases` row is a foreign key onto `loops`: a
+        // Loop becomes leasable once its genesis Checkpoint exists, not
+        // before. Mirroring that here (rather than letting any `loop_id`
+        // acquire a lease) is what makes this fake catch a caller that gets
+        // create()'s lease/genesis ordering backwards, instead of silently
+        // handing back a lease — and a fencing token — for a Loop that does
+        // not durably exist yet.
+        if !self
+            .loops
+            .lock()
+            .expect("loops lock poisoned")
+            .contains_key(&request.loop_id)
+        {
+            return Err(StoreError::LoopNotFound(request.loop_id));
+        }
+
         let mut leases = self.leases.lock().expect("leases lock poisoned");
         if let Some(existing) = leases.get(&request.loop_id)
             && existing.holder_id != request.holder_id
@@ -607,19 +634,13 @@ async fn commit_checkpoint_creates_a_fresh_loop_and_then_updates_it() {
     // method, so this drives genesis purely through the trait —
     // `commit_checkpoint` with `expected_revision: 0` and
     // `expected_checkpoint_version: 0` against an unknown `loop_id`
-    // (`docs/02-core-domain-model.md` §7, `docs/03` §5).
+    // (`docs/02-core-domain-model.md` §7, `docs/03` §5). An uncreated Loop
+    // has no lease row and a current fencing token of `0`, which is exactly
+    // the token the genesis commit must present — genesis comes *before*
+    // any lease is acquired, not after: a real store's `loop_leases` row is
+    // a foreign key onto `loops`, so a Loop only becomes leasable once its
+    // genesis Checkpoint exists.
     let loop_id = ports.ids.new_loop_id();
-    let holder = RuntimeInstanceId::new();
-    let lease = ports
-        .store
-        .acquire_lease(AcquireLease {
-            loop_id,
-            holder_id: holder,
-            ttl: time::Duration::seconds(30),
-        })
-        .await
-        .expect("lease acquisition succeeds");
-
     let genesis_checkpoint = Checkpoint {
         id: CheckpointId::new(),
         loop_id,
@@ -640,7 +661,7 @@ async fn commit_checkpoint_creates_a_fresh_loop_and_then_updates_it() {
             loop_id,
             expected_revision: 0,
             expected_checkpoint_version: 0,
-            fencing_token: lease.fencing_token,
+            fencing_token: 0,
             checkpoint: genesis_checkpoint.clone(),
             events: vec![LoopEvent::CheckpointCommitted {
                 checkpoint: genesis_checkpoint.clone(),
@@ -648,7 +669,7 @@ async fn commit_checkpoint_creates_a_fresh_loop_and_then_updates_it() {
             state: genesis.clone(),
         })
         .await
-        .expect("genesis commit succeeds against an unknown loop_id");
+        .expect("genesis commit succeeds against an unknown loop_id, fenced by token 0");
     assert_eq!(created.state.execution.aggregate_revision, 1);
     assert_eq!(created.state.execution.checkpoint_version, 1);
     assert_eq!(created.events.len(), 1);
@@ -658,9 +679,22 @@ async fn commit_checkpoint_creates_a_fresh_loop_and_then_updates_it() {
     let loaded = ports.store.load(loop_id).await.expect("load succeeds");
     assert_eq!(loaded.state.execution.id, loop_id);
 
+    // Only now — once the Loop durably exists — can a lease be acquired for
+    // it.
+    let holder = RuntimeInstanceId::new();
+    let lease = ports
+        .store
+        .acquire_lease(AcquireLease {
+            loop_id,
+            holder_id: holder,
+            ttl: time::Duration::seconds(30),
+        })
+        .await
+        .expect("lease acquisition succeeds now that the loop exists");
+
     // A second, authoritative commit against the now-existing Loop is
     // fenced against the revision and checkpoint version the genesis
-    // commit just established.
+    // commit just established, and against the lease's fencing token.
     let second_checkpoint = Checkpoint {
         id: CheckpointId::new(),
         loop_id,
@@ -690,6 +724,22 @@ async fn commit_checkpoint_creates_a_fresh_loop_and_then_updates_it() {
         .expect("commit against the existing loop succeeds");
     assert_eq!(updated.state.execution.checkpoint_version, 2);
     assert_eq!(updated.events.len(), 1); // unchanged: this commit added no new events
+}
+
+#[tokio::test]
+async fn acquire_lease_rejects_a_loop_that_does_not_exist_yet() {
+    let (ports, _seeded_loop_id, _fixed_now) = build_ports();
+    let loop_id = ports.ids.new_loop_id();
+
+    let result = ports
+        .store
+        .acquire_lease(AcquireLease {
+            loop_id,
+            holder_id: RuntimeInstanceId::new(),
+            ttl: time::Duration::seconds(30),
+        })
+        .await;
+    assert!(matches!(result, Err(StoreError::LoopNotFound(id)) if id == loop_id));
 }
 
 #[tokio::test]

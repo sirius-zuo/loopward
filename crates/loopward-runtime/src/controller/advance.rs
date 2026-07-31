@@ -44,31 +44,41 @@
 //! Session, verify, commit). Each call still performs at most one durable
 //! Episode transition, honoring `docs/07` §14 exactly.
 //!
-//! # A found gap in `LoopStore::append`
+//! # A fixed gap in `LoopStore::append`
 //!
 //! Neither `loopward-store-sqlite`'s `SqliteLoopStore` nor
-//! `port_contract.rs`'s `InMemoryLoopStore` fake folds appended events into
-//! the projection fields (`episode`, `session`, `work_unit`, `attempt`) that
-//! `append` returns or persists — both implementations only advance
-//! `aggregate_revision` and round-trip the rest of the projection unchanged
-//! (neither calls `loopward_core::evolve`). A `store.load()` performed
-//! between two `append` calls, without an intervening `commit_checkpoint`,
-//! would therefore observe a stale projection. [`LoopController`] works
-//! around this by never re-loading mid-Episode: every helper below folds
-//! events into its own locally computed [`AggregateState`] via `evolve` and
-//! carries that value forward for the rest of the call, and each Episode
-//! always ends with [`LoopStore::commit_checkpoint`], which *does* take a
-//! caller-computed `state` and persists it verbatim — so the next
-//! `advance()` call's `store.load()` is always correct. This is safe for
-//! Phase One's synchronous, single-writer-per-lease design, but it is a real
-//! defect: any future path that calls `store.load()` mid-Episode (crash
-//! recovery restarting a partially advanced Episode — Task 10's concern)
-//! would observe the staleness and needs `LoopStore::append` fixed first.
+//! `port_contract.rs`'s `InMemoryLoopStore` fake used to fold appended
+//! events into the projection fields (`episode`, `session`, `work_unit`,
+//! `attempt`) that `append` returns or persists — both only advanced
+//! `aggregate_revision` and round-tripped the rest of the projection
+//! unchanged. This was a real, currently-manifesting defect, not a
+//! future-only one: it silently broke [`LoopController::suspend`] on an idle
+//! Loop (the only durable write there is a bare `append` of `LoopSuspended`,
+//! which would leave the stored `execution.status` at `Active`), the
+//! `LifecycleCommand::Complete` branch of [`LoopController::advance`] (same shape —
+//! `LoopCompleted` appended but never reflected), and every early return
+//! from inside an Episode after `StartEpisode` but before the terminal
+//! commit (the next `advance()` call's `store.load()` would show no active
+//! Episode, so [`ControllerError::RecoveryRequired`] would never fire, and
+//! the controller would start a second Episode on top of the first one's
+//! orphaned journal entries).
+//!
+//! Both implementations now fold each event through `loopward_core::evolve`
+//! before persisting the projection — exactly mirroring what
+//! `commit_checkpoint` already does with its caller-supplied `state` — so
+//! `store.load()` is correct immediately after *any* durable write, not only
+//! after a Checkpoint commit. All three breakages above are fixed at the
+//! root: a plain `append` of `LoopSuspended`/`LoopCompleted` now correctly
+//! persists the new status, and an interrupted mid-Episode call now leaves a
+//! projection the next `advance()` call correctly recognizes as needing
+//! recovery.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use loopward_api::context::{BootPackageManifest, ContextBudget, ContextBudgetRequest};
+use loopward_api::context::{
+    BootPackageManifest, ContextBudget, ContextBudgetRequest, ContextClass, ContextPriority,
+};
 use loopward_api::ids::{EpisodeId, LoopId};
 use loopward_api::loop_service::{RunCondition, RunLimits};
 use loopward_api::resource::{OpaqueRef, ResourceRef, VerificationPlanRef};
@@ -104,23 +114,61 @@ use crate::{HydrationError, HydrationReport, HydrationRequest};
 /// doc comment names this as the hydrator's expected input, supplied by a
 /// component this plan has not built yet). This is [`LoopController`]'s seam
 /// for one, mirroring [`VerificationPlanResolver`]: a deployment plugs in a
-/// real Checkpoint Manager here; the default
-/// [`LoopController::new`] configuration supplies no candidates at all,
-/// which still hydrates correctly for a Work Unit with no pinned
-/// constraints (the hydrator synthesizes required candidates for declared
-/// inputs on its own).
+/// real Checkpoint Manager here. The default
+/// [`LoopController::new`] configuration ([`DefaultContextCandidates`]) does
+/// not fabricate decisions, observations, or other Checkpoint-Manager-owned
+/// material it has no source for, but it does project the one piece of
+/// pinned state this controller already holds directly —
+/// [`WorkUnit::constraints`] — into required pinned candidates. Without
+/// that, the pinned-survives-hydration-and-drain integrity check (Global
+/// Constraints; see the drain-time re-hydration in
+/// [`Self::run_execution_episode`]) would be a permanent no-op in any real
+/// deployment that has not wired in its own provider, since an empty pinned
+/// set hashes to one constant digest that can never differ.
 pub trait ContextCandidateProvider: Send + Sync {
     /// Returns the candidates to offer the hydrator for `work_unit`, judged
     /// against `checkpoint`.
     fn candidates(&self, work_unit: &WorkUnit, checkpoint: &Checkpoint) -> Vec<ContextCandidate>;
 }
 
-/// A [`ContextCandidateProvider`] that never offers any candidate.
-struct NoContextCandidates;
+/// The default [`ContextCandidateProvider`]: projects each of
+/// [`WorkUnit::constraints`] into a required pinned candidate, and offers
+/// nothing else.
+///
+/// This keeps the pinned-digest integrity check live by default rather than
+/// only when a caller happens to inject a special provider, without
+/// fabricating decisions, observations, or other material only a real
+/// Checkpoint Manager can source.
+struct DefaultContextCandidates;
 
-impl ContextCandidateProvider for NoContextCandidates {
-    fn candidates(&self, _work_unit: &WorkUnit, _checkpoint: &Checkpoint) -> Vec<ContextCandidate> {
-        Vec::new()
+impl ContextCandidateProvider for DefaultContextCandidates {
+    fn candidates(&self, work_unit: &WorkUnit, _checkpoint: &Checkpoint) -> Vec<ContextCandidate> {
+        work_unit
+            .constraints
+            .iter()
+            .enumerate()
+            .map(|(index, constraint)| ContextCandidate {
+                estimated_tokens: None,
+                selection_reason: format!(
+                    "declared work unit constraint `{}`",
+                    constraint.reference
+                ),
+                ..ContextCandidate::new(
+                    format!("work-unit-constraint-{index:04}"),
+                    "constraint",
+                    ResourceRef {
+                        uri: constraint.reference.clone(),
+                        media_type: None,
+                        digest: None,
+                        version: None,
+                        size: None,
+                        summary: None,
+                    },
+                    ContextClass::Pinned,
+                    ContextPriority::Required,
+                )
+            })
+            .collect()
     }
 }
 
@@ -171,6 +219,13 @@ pub enum OperationOutcome {
         episode_id: EpisodeId,
         /// The Checkpoint version it committed.
         checkpoint_version: u64,
+        /// Whether this Episode started a new Work Unit Attempt (`true` for
+        /// a completed Execution Episode; `false` for a Verification
+        /// Episode, which never calls the runner). `LoopController::run_until`
+        /// uses this to enforce `ResourceCost::work_unit_attempts`, the one
+        /// resource-cost bound it can enforce without a resource-cost-
+        /// accounting port no prior task defines.
+        started_attempt: bool,
     },
     /// The Loop suspended before or during this call.
     Suspended,
@@ -293,7 +348,7 @@ impl LoopController {
             runner,
             verification: VerificationEngine::new(),
             plans,
-            candidates: Arc::new(NoContextCandidates),
+            candidates: Arc::new(DefaultContextCandidates),
             policy: EffectivePolicy::default(),
             holder_id: RuntimeInstanceId::new(),
             context_rule_version: "loopward.context-rules/v0.1".to_owned(),
@@ -347,8 +402,10 @@ impl LoopController {
         self
     }
 
-    /// Overrides the context candidate provider (default: none, so a Boot
-    /// Package hydrates from only the Work Unit's own declared inputs).
+    /// Overrides the context candidate provider (default:
+    /// [`DefaultContextCandidates`], which projects
+    /// [`WorkUnit::constraints`] into required pinned candidates and offers
+    /// nothing else).
     #[must_use]
     pub fn with_candidate_provider(
         mut self,
@@ -661,15 +718,28 @@ impl LoopController {
         condition: RunCondition,
         limits: RunLimits,
     ) -> Result<Vec<OperationOutcome>, ControllerError> {
+        // `max_resource_cost` only counts as a bound here when it actually
+        // sets `work_unit_attempts`: that is the one resource-cost limit
+        // this controller can enforce below (it already knows how many
+        // Attempts it started). A `max_resource_cost` that sets only
+        // `estimated_tokens` — which no port from any prior task lets this
+        // controller account for — would leave the loop genuinely
+        // unbounded despite looking bounded, so it does not satisfy this
+        // check (`docs/07-session-rotation.md` §14: "an unbounded hidden
+        // execution loop is not part of the public API").
+        let max_work_unit_attempts = limits
+            .max_resource_cost
+            .and_then(|cost| cost.work_unit_attempts);
         if limits.max_episodes.is_none()
             && limits.deadline.is_none()
-            && limits.max_resource_cost.is_none()
+            && max_work_unit_attempts.is_none()
         {
             return Err(ControllerError::UnboundedRunUntil);
         }
 
         let mut outcomes = Vec::new();
         let mut episodes = 0u32;
+        let mut work_unit_attempts = 0u32;
         loop {
             if let Some(max) = limits.max_episodes
                 && episodes >= max
@@ -678,6 +748,11 @@ impl LoopController {
             }
             if let Some(deadline) = limits.deadline
                 && self.ports.clock.now() >= deadline
+            {
+                break;
+            }
+            if let Some(max) = max_work_unit_attempts
+                && work_unit_attempts >= max
             {
                 break;
             }
@@ -693,8 +768,14 @@ impl LoopController {
                     RunCondition::UntilTerminalOrSuspended
                 )
             );
-            if matches!(outcome, OperationOutcome::EpisodeCompleted { .. }) {
+            if let OperationOutcome::EpisodeCompleted {
+                started_attempt, ..
+            } = &outcome
+            {
                 episodes += 1;
+                if *started_attempt {
+                    work_unit_attempts += 1;
+                }
             }
             outcomes.push(outcome);
             if stop {
@@ -738,13 +819,20 @@ impl LoopController {
 
         let report = self.hydrator.hydrate(hydration_request.clone()).await?;
         let selected_tokens = report.selected_tokens();
-        let budget_decision = RotationPolicy::evaluate(&RotationContext {
-            hard_context_budget: selected_tokens >= budget.hard_input_limit_tokens,
-            soft_context_budget: selected_tokens >= budget.soft_input_limit_tokens,
+        let hard_context_budget = selected_tokens >= budget.hard_input_limit_tokens;
+        let soft_context_budget = selected_tokens >= budget.soft_input_limit_tokens;
+
+        // The hard-budget admission check is evaluated on its own, before
+        // any Work Unit boundary exists to compete with it: nothing has run
+        // yet, so `hard_context_budget`/`soft_context_budget` are the only
+        // signals that could possibly apply at this point in the call.
+        let admission_decision = RotationPolicy::evaluate(&RotationContext {
+            soft_context_budget,
+            hard_context_budget,
             ..RotationContext::default()
         });
 
-        if budget_decision.primary_reason == Some(RotationReason::HardContextBudget) {
+        if admission_decision.primary_reason == Some(RotationReason::HardContextBudget) {
             // The hard context budget stops admission before any model work
             // is started: no Session, no Attempt, no runner call
             // (`docs/07` §10).
@@ -901,11 +989,23 @@ impl LoopController {
             )
             .await?;
 
-        let reason = if budget_decision.primary_reason == Some(RotationReason::SoftContextBudget) {
-            RotationReason::SoftContextBudget
-        } else {
-            RotationReason::WorkUnitBoundary
-        };
+        // The Attempt just finished: this is a genuine Work Unit boundary,
+        // evaluated alongside whatever budget signal was observed, through
+        // the same `RotationPolicy::evaluate` every signal goes through —
+        // not a hand-rolled shortcut that could disagree with
+        // `PRECEDENCE`'s own ranking. `WorkUnitBoundary` is mandatory and
+        // outranks the advisory `SoftContextBudget`, so it wins the primary
+        // slot whenever both apply; the budget signal still rides along in
+        // `signals` for whoever consults the full decision, even though
+        // only the primary reason is durably recorded on this event today.
+        let rotation_decision = RotationPolicy::evaluate(&RotationContext {
+            work_unit_boundary: true,
+            soft_context_budget,
+            ..RotationContext::default()
+        });
+        let reason = rotation_decision
+            .primary_reason
+            .unwrap_or(RotationReason::WorkUnitBoundary);
         let committed = self
             .rotate_and_commit(loop_id, lease, state, episode_id, reason)
             .await?;
@@ -913,6 +1013,7 @@ impl LoopController {
         Ok(OperationOutcome::EpisodeCompleted {
             episode_id,
             checkpoint_version: committed.checkpoint.version,
+            started_attempt: true,
         })
     }
 
@@ -1058,6 +1159,7 @@ impl LoopController {
         Ok(OperationOutcome::EpisodeCompleted {
             episode_id,
             checkpoint_version: committed.checkpoint.version,
+            started_attempt: false,
         })
     }
 

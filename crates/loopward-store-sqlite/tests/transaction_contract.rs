@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use loopward_api::ids::{CheckpointId, EpisodeId, LoopId, SessionId};
 use loopward_api::loop_service::LoopKind;
 use loopward_api::resource::{PhaseRef, ResourceRef, RunnerRef};
+use loopward_api::runner::SuspensionReason;
 use loopward_api::work_unit::ResourceBudget;
 use loopward_core::{
     AggregateState, Checkpoint, Episode, EpisodeKind, EpisodeStatus, LoopEvent, LoopExecution,
@@ -382,6 +383,51 @@ async fn append_rejects_a_stale_fencing_token() {
         .await
         .expect("the current fencing token writes");
     assert_eq!(stored.state.execution.aggregate_revision, 2);
+}
+
+/// `append` folds each event through `loopward_core::evolve` before
+/// persisting the projection, exactly mirroring what `commit_checkpoint`
+/// already does with its caller-supplied `state`. This is the fix for a real
+/// defect: a bare `append` used to only advance `aggregate_revision`,
+/// leaving `execution.status` (and every other projection field) stale.
+/// That silently broke `LoopController::suspend` on an idle Loop — the only
+/// durable write there, with no Episode active to also commit a Checkpoint
+/// for, is exactly this: a bare `append` of `LoopSuspended`.
+#[tokio::test]
+async fn append_folds_events_into_the_persisted_projection_not_just_the_revision() {
+    let harness = Harness::open().await;
+    let loop_id = LoopId::new();
+    commit_genesis(&harness, loop_id).await;
+
+    let lease = harness
+        .store
+        .acquire_lease(AcquireLease {
+            loop_id,
+            holder_id: RuntimeInstanceId::new(),
+            ttl: time::Duration::seconds(30),
+        })
+        .await
+        .expect("lease acquisition succeeds");
+
+    let appended = harness
+        .store
+        .append(
+            loop_id,
+            1,
+            lease.fencing_token,
+            vec![LoopEvent::LoopSuspended {
+                reason: SuspensionReason::OperatorRequest,
+            }],
+        )
+        .await
+        .expect("append succeeds");
+    assert_eq!(appended.state.execution.status, LoopStatus::Suspended);
+
+    // And it survives a completely fresh `load()`, not just the value this
+    // one `append` call happened to return.
+    let reloaded = harness.store.load(loop_id).await.expect("load succeeds");
+    assert_eq!(reloaded.state.execution.status, LoopStatus::Suspended);
+    assert_eq!(reloaded.state.execution.aggregate_revision, 2);
 }
 
 #[tokio::test]

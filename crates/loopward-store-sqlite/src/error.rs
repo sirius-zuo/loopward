@@ -19,6 +19,7 @@
 //! ```
 
 use loopward_api::ids::{CheckpointId, EpisodeId, LoopId, SessionId};
+use loopward_core::DomainError;
 use loopward_runtime::ports::{ResourceError, StoreError};
 
 /// A failure of the `SQLite`/filesystem backend, or of a storage invariant
@@ -180,6 +181,24 @@ pub enum SqliteStoreError {
         /// The underlying I/O failure.
         #[source]
         source: std::io::Error,
+    },
+
+    /// An `append`ed event did not apply to the projection it was folded
+    /// against.
+    ///
+    /// `append`'s caller (`loopward-runtime`) already validated the event
+    /// against this exact projection with `loopward_core::decide` before
+    /// calling `append`; this only fires if the projection this store read
+    /// under the write lock somehow disagrees with the one the caller
+    /// decided against, which is itself a serious consistency bug rather
+    /// than an ordinary contract failure.
+    #[error("event could not be applied to loop {loop_id}'s projection: {source}")]
+    EventDidNotApply {
+        /// The Loop whose projection the event was folded against.
+        loop_id: LoopId,
+        /// The underlying reducer failure.
+        #[source]
+        source: DomainError,
     },
 }
 

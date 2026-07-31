@@ -391,6 +391,18 @@ impl LoopStore for InMemoryLoopStore {
     }
 
     async fn acquire_lease(&self, request: AcquireLease) -> Result<LoopLease, StoreError> {
+        // Mirrors a real store: `loop_leases` is a foreign key onto `loops`,
+        // so an uncreated Loop cannot be leased yet — only genesis-committed
+        // (fenced by the token `0` every uncreated Loop presents).
+        if !self
+            .loops
+            .lock()
+            .expect("loops lock poisoned")
+            .contains_key(&request.loop_id)
+        {
+            return Err(StoreError::LoopNotFound(request.loop_id));
+        }
+
         let mut leases = self.leases.lock().expect("leases lock poisoned");
         if let Some(existing) = leases.get(&request.loop_id)
             && existing.holder_id != request.holder_id
@@ -1035,9 +1047,18 @@ async fn soft_budget_rotates_at_the_next_safe_boundary() {
             LoopEvent::RotationRequested { reason, .. } => Some(*reason),
             _ => None,
         });
+    // `RotationPolicy::PRECEDENCE` ranks `WorkUnitBoundary` (mandatory)
+    // strictly above `SoftContextBudget` (advisory) — a soft budget signal
+    // rides along as a contributing signal but never displaces the primary
+    // reason a mandatory boundary already supplies. This Attempt just
+    // finished (a genuine Work Unit boundary) at the same time the soft
+    // budget was crossed, so the durably recorded reason is
+    // `WorkUnitBoundary`, not `SoftContextBudget` — proving the controller
+    // actually defers to `RotationPolicy::evaluate`'s precedence rather than
+    // a hand-rolled shortcut that could disagree with it.
     assert_eq!(
         rotation_reason,
-        Some(loopward_core::RotationReason::SoftContextBudget)
+        Some(loopward_core::RotationReason::WorkUnitBoundary)
     );
     assert_eq!(
         runner.start_calls(),
@@ -1188,6 +1209,66 @@ async fn drain_result_cannot_commit_when_pinned_digest_differs() {
     assert_eq!(suspended_reason, Some(SuspensionReason::Recovery));
 }
 
+/// The *default* `ContextCandidateProvider` (no `with_candidate_provider`
+/// call at all) already projects a Work Unit's declared constraints into
+/// required pinned candidates, so the pinned-digest integrity check is live
+/// out of the box rather than only when a caller happens to wire in a
+/// special provider.
+#[tokio::test]
+async fn default_candidate_provider_makes_the_pinned_integrity_check_live() {
+    let broker = Arc::new(InMemoryResourceBroker::new());
+    let handle = broker
+        .begin(ResourceBeginHint::default())
+        .await
+        .expect("begin succeeds");
+    broker
+        .write(&handle, b"pinned-content-v1")
+        .await
+        .expect("write succeeds");
+    let pinned_ref = broker.finalize(handle).await.expect("finalize succeeds");
+
+    let work_unit_id = WorkUnitId::new();
+    let work_unit = test_work_unit(
+        work_unit_id,
+        Vec::new(),
+        vec![ConstraintRef {
+            reference: pinned_ref.uri.clone(),
+        }],
+    );
+    let (ports, loop_id, broker) = build_ports_with_broker(Some(work_unit), broker);
+
+    let runner = Arc::new(FakeRunner::mutating_pinned_resource_on_collect(
+        Arc::clone(&broker),
+        pinned_ref.uri.clone(),
+        b"pinned-content-v2".to_vec(),
+    ));
+    // No `.with_candidate_provider(...)` here: this is the controller's
+    // out-of-the-box configuration.
+    let controller = LoopController::new(
+        ports.clone(),
+        Arc::clone(&runner) as Arc<dyn WorkUnitRunner>,
+        Arc::new(AlwaysAcceptPlan),
+    )
+    .with_default_budget(generous_budget());
+
+    let outcome = controller.advance(loop_id).await.expect("advance succeeds");
+    assert_eq!(outcome, OperationOutcome::Suspended);
+
+    let stored = ports.store.load(loop_id).await.expect("load succeeds");
+    assert_eq!(stored.state.execution.status, LoopStatus::Suspended);
+    let rotation_reason = stored
+        .events
+        .iter()
+        .find_map(|recorded| match &recorded.event {
+            LoopEvent::RotationRequested { reason, .. } => Some(*reason),
+            _ => None,
+        });
+    assert_eq!(
+        rotation_reason,
+        Some(loopward_core::RotationReason::ContextIntegrityFailure)
+    );
+}
+
 // ---------------------------------------------------------------------------
 // run_until and RuntimeLoopService
 // ---------------------------------------------------------------------------
@@ -1238,6 +1319,75 @@ async fn run_until_stops_after_max_episodes() {
         outcomes[0],
         OperationOutcome::EpisodeCompleted { .. }
     ));
+}
+
+/// A `max_resource_cost` that sets `work_unit_attempts` is a real, enforced
+/// bound: with only one Attempt permitted, `run_until` stops after the
+/// Execution Episode starts it, even though the Verification Episode
+/// (`started_attempt: false`) would otherwise be free to run too.
+#[tokio::test]
+async fn run_until_stops_after_max_work_unit_attempts() {
+    let work_unit_id = WorkUnitId::new();
+    let work_unit = test_work_unit(work_unit_id, Vec::new(), Vec::new());
+    let (ports, loop_id, broker) = build_ports(Some(work_unit));
+    let runner = Arc::new(FakeRunner::new(Arc::clone(&broker)));
+    let controller = LoopController::new(
+        ports,
+        Arc::clone(&runner) as Arc<dyn WorkUnitRunner>,
+        Arc::new(AlwaysAcceptPlan),
+    )
+    .with_default_budget(generous_budget());
+
+    let outcomes = controller
+        .run_until(
+            loop_id,
+            RunCondition::UntilTerminal,
+            RunLimits {
+                max_episodes: None,
+                deadline: None,
+                max_resource_cost: Some(loopward_api::loop_service::ResourceCost {
+                    work_unit_attempts: Some(1),
+                    estimated_tokens: None,
+                }),
+            },
+        )
+        .await
+        .expect("run_until succeeds");
+    // Exactly the one Execution Episode that started the bounded Attempt —
+    // not the Verification Episode that would otherwise follow it.
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(runner.start_calls(), 1);
+}
+
+/// A `max_resource_cost` that sets only `estimated_tokens` — a limit this
+/// controller has no port to account for yet — must not be accepted as
+/// satisfying "at least one limit": accepting it would leave the loop
+/// genuinely unbounded despite `run_until` looking bounded to the caller.
+#[tokio::test]
+async fn run_until_rejects_a_resource_cost_that_sets_only_unenforced_fields() {
+    let (ports, loop_id, broker) = build_ports(None);
+    let runner = Arc::new(FakeRunner::new(broker));
+    let controller = LoopController::new(
+        ports,
+        runner as Arc<dyn WorkUnitRunner>,
+        Arc::new(AlwaysAcceptPlan),
+    );
+
+    let result = controller
+        .run_until(
+            loop_id,
+            RunCondition::UntilTerminal,
+            RunLimits {
+                max_episodes: None,
+                deadline: None,
+                max_resource_cost: Some(loopward_api::loop_service::ResourceCost {
+                    work_unit_attempts: None,
+                    estimated_tokens: Some(1_000),
+                }),
+            },
+        )
+        .await;
+    assert!(matches!(result, Err(ControllerError::UnboundedRunUntil)));
 }
 
 #[tokio::test]

@@ -233,6 +233,29 @@ mod tests {
     }
 
     #[test]
+    fn work_unit_boundary_outranks_a_concurrent_soft_budget_signal() {
+        // A mandatory Work Unit boundary and an advisory soft budget signal
+        // can both apply to the same Attempt (it just finished, and the
+        // Boot Package it ran under also crossed the soft limit). The
+        // mandatory reason must still win the primary slot; the advisory
+        // one only rides along as a contributing signal. `LoopController`
+        // depends on exactly this precedence to decide which
+        // `RotationReason` to record when both are true at once.
+        let context = RotationContext {
+            work_unit_boundary: true,
+            soft_context_budget: true,
+            ..RotationContext::default()
+        };
+        let decision = RotationPolicy::evaluate(&context);
+        assert_eq!(
+            decision.primary_reason,
+            Some(RotationReason::WorkUnitBoundary)
+        );
+        assert!(decision.mandatory);
+        assert_eq!(decision.signals.len(), 2);
+    }
+
+    #[test]
     fn soft_budget_alone_recommends_without_forcing() {
         let context = RotationContext {
             soft_context_budget: true,

@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use loopward_api::ids::{LoopId, Timestamp};
-use loopward_core::{AggregateState, LoopEvent};
+use loopward_core::{AggregateState, LoopEvent, evolve};
 use loopward_runtime::ports::{
     AcquireLease, CheckpointCommitRequest, LoopLease, LoopStore, StoreError, StoredLoop,
 };
@@ -208,14 +208,31 @@ impl SqliteLoopStore {
             });
         }
 
+        // Fold each event into the projection via the same `evolve` the
+        // caller already validated it against with `decide`, mirroring what
+        // `commit_checkpoint` already does with its caller-supplied `state`
+        // (§1: `append` durably records a domain fact, and the projection it
+        // persists must actually reflect that fact — not just an advanced
+        // revision counter). Without this, `episode`/`session`/`work_unit`/
+        // `attempt` would silently round-trip unchanged between two
+        // `append` calls with no intervening Checkpoint commit, and a
+        // caller's next `load()` would observe a stale projection even
+        // though the journal and the revision both advanced correctly.
         let mut sequence = event::max_sequence(connection, loop_id).await?;
-        let mut revision = actual_revision;
         for domain_event in events {
-            revision += 1;
+            state = evolve(state, domain_event)
+                .map_err(|source| SqliteStoreError::EventDidNotApply { loop_id, source })?;
             sequence += 1;
-            event::insert(connection, loop_id, sequence, revision, domain_event, now).await?;
+            event::insert(
+                connection,
+                loop_id,
+                sequence,
+                state.execution.aggregate_revision,
+                domain_event,
+                now,
+            )
+            .await?;
         }
-        state.execution.aggregate_revision = revision;
 
         write_projection_row(connection, loop_id, &state).await?;
         load_stored(connection, loop_id)

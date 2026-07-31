@@ -114,6 +114,35 @@ impl RuntimeLoopService {
 
 #[async_trait::async_trait]
 impl loopward_api::loop_service::LoopService for RuntimeLoopService {
+    /// # Known limitation: most of `CreateLoopRequest` is validated, then
+    /// discarded
+    ///
+    /// `request.goal`, `success_criteria`, `pinned_constraints`,
+    /// `domain_schema`, `initial_domain_state`, and `policies` are checked by
+    /// [`validate_create_request`] but never stored anywhere durable. This is
+    /// not an oversight this method is hiding: `loopward_core::Checkpoint` is
+    /// deliberately Core's identity-and-versioning view only (id, `loop_id`,
+    /// version, aggregate revision, parent, episode — see its own doc
+    /// comment) and has no field for a goal, success criteria, pinned
+    /// constraints, or domain state. The full Checkpoint content model
+    /// (`docs/schemas/checkpoint-v0.1.yaml`) has no Rust type in this crate
+    /// yet, a known drift from Tasks 3/4 this task does not have the file
+    /// scope to close.
+    ///
+    /// `pinned_constraints` is the most concerning field to drop silently,
+    /// given the Global Constraint that pinned state must survive hydration
+    /// and drain losslessly — but note that Phase One's `create()` also
+    /// produces a Loop with `work_unit: None` (no `LifecycleCommand` assigns
+    /// one; see [`ControllerError::NoWorkUnit`]'s doc comment), so there is
+    /// nowhere to attach them yet even in memory: the controller's default
+    /// candidate provider (`DefaultContextCandidates`) projects
+    /// `WorkUnit::constraints`, not `CreateLoopRequest::pinned_constraints`,
+    /// and today those are two different, currently disconnected lists.
+    /// Whether a Loop's creation-time `pinned_constraints` should
+    /// automatically populate every future Work Unit's `constraints` is a
+    /// real design question for whoever builds Work Unit assignment — this
+    /// method does not answer it, only avoids silently pretending the
+    /// question does not exist.
     async fn create(&self, request: CreateLoopRequest) -> Result<LoopHandle, LoopwardError> {
         if let Some(existing) = self.previously_accepted(&request.metadata.idempotency_key) {
             return Ok(LoopHandle {
@@ -125,15 +154,6 @@ impl loopward_api::loop_service::LoopService for RuntimeLoopService {
 
         let ports = self.controller.ports();
         let loop_id = ports.ids.new_loop_id();
-        let lease = ports
-            .store
-            .acquire_lease(crate::ports::AcquireLease {
-                loop_id,
-                holder_id: self.controller.holder_id(),
-                ttl: time::Duration::seconds(60),
-            })
-            .await
-            .map_err(|error| store_error(&error))?;
 
         let checkpoint = loopward_core::Checkpoint {
             id: ports.ids.new_checkpoint_id(),
@@ -163,16 +183,38 @@ impl loopward_api::loop_service::LoopService for RuntimeLoopService {
             checkpoint: checkpoint.clone(),
         };
 
+        // Genesis first, fenced by `0` — an uncreated Loop has no lease row
+        // and a current fencing token of `0`
+        // (`loopward-store-sqlite/src/lease.rs`'s own module doc says this
+        // precisely: "exactly the token a genesis `commit_checkpoint` must
+        // present"). Acquiring a lease *before* the Loop exists would fail
+        // outright against the real store (`acquire_lease` requires the Loop
+        // to already exist), and even a lenient fake that let it through
+        // would hand back fencing token `1`, which a genesis commit must
+        // *not* present. The lease is acquired only once the Loop is
+        // durable, immediately after — closing the window a caller with
+        // knowledge of `loop_id` could otherwise use to write with the
+        // still-current token `0`.
         let stored = ports
             .store
             .commit_checkpoint(crate::ports::CheckpointCommitRequest {
                 loop_id,
                 expected_revision: 0,
                 expected_checkpoint_version: 0,
-                fencing_token: lease.fencing_token,
+                fencing_token: 0,
                 checkpoint: checkpoint.clone(),
                 events: vec![loopward_core::LoopEvent::CheckpointCommitted { checkpoint }],
                 state,
+            })
+            .await
+            .map_err(|error| store_error(&error))?;
+
+        ports
+            .store
+            .acquire_lease(crate::ports::AcquireLease {
+                loop_id,
+                holder_id: self.controller.holder_id(),
+                ttl: time::Duration::seconds(60),
             })
             .await
             .map_err(|error| store_error(&error))?;
