@@ -237,6 +237,22 @@ fn spec(
     }
 }
 
+fn spec_with_criterion(
+    id: &str,
+    kind: VerificationGateKind,
+    enforcement: GateEnforcement,
+    criterion: &str,
+    config: GateConfig,
+) -> VerificationGateSpec {
+    VerificationGateSpec {
+        id: GateId::new(id),
+        kind,
+        enforcement,
+        criterion: Some(CriterionId::new(criterion)),
+        config,
+    }
+}
+
 fn command_config(script: &str) -> GateConfig {
     GateConfig::Deterministic(DeterministicGateConfig {
         program: "sh".to_owned(),
@@ -738,6 +754,42 @@ async fn the_schema_gate_fails_a_result_missing_a_required_field() {
 }
 
 #[tokio::test]
+async fn the_schema_gate_accepts_a_non_json_output_when_nothing_is_configured_to_check() {
+    let engine = VerificationEngine::new();
+    // A plain-Markdown artifact, not JSON at all. Nothing in the plan below
+    // names a `required_pointers` entry, so the schema gate has nothing to
+    // check inside the bytes and must not fail parsing content it was never
+    // configured to look at.
+    let body = "# Report\n\nEverything looks good.\n";
+    let outputs = vec![output_ref("resource://output/1", body)];
+    let target = target_for(&outputs, 1);
+    let gates = vec![spec(
+        "schema",
+        VerificationGateKind::Schema,
+        GateEnforcement::Required,
+        GateConfig::Schema(SchemaGateConfig {
+            contract: OutputContract {
+                schema: "loopward.domain.markdown-report/v0.1".to_owned(),
+            },
+            ..SchemaGateConfig::default()
+        }),
+    )];
+    let broker = InMemoryBroker::with(&[("resource://output/1", body)]);
+
+    let run = engine
+        .evaluate(request(
+            plan(target, gates),
+            produced_result(outputs),
+            broker,
+        ))
+        .await
+        .expect("evaluation completes");
+
+    assert_eq!(run.outcome, VerificationOutcome::Accepted);
+    assert_eq!(run.findings[0].outcome, GateOutcome::Passed);
+}
+
+#[tokio::test]
 async fn the_integrity_gate_fails_when_content_does_not_hash_to_its_declared_digest() {
     let engine = VerificationEngine::new();
     // The declared digest is over `RESULT_BODY`, but the broker serves
@@ -1067,6 +1119,73 @@ fn loop_completion_is_permitted_when_every_required_criterion_has_current_eviden
         ]
     );
     assert!(assessment.obstacles.is_empty());
+}
+
+#[tokio::test]
+async fn completion_stays_permitted_as_verification_evidence_accumulates_across_checkpoints() {
+    // `VerificationRun.findings` is durable and ever-growing: every prior
+    // run's findings are carried forward (superseded to `Stale` once their
+    // target moves), and every fresh finding is appended. Feeding that
+    // accumulated, realistic history into `assess_completion` must not make
+    // completion *less* likely over time — a criterion the Loop's current
+    // evidence satisfies stays satisfied no matter how much now-superseded
+    // history sits alongside it.
+    let engine = VerificationEngine::new();
+    let outputs = vec![output_ref("resource://output/1", RESULT_BODY)];
+    let gates = vec![spec_with_criterion(
+        "unit-tests",
+        VerificationGateKind::Deterministic,
+        GateEnforcement::Required,
+        "criterion-001",
+        command_config("exit 0"),
+    )];
+
+    // First verification run, recorded against Checkpoint 7.
+    let target_v1 = target_for(&outputs, 1);
+    let mut first_req = request(
+        plan(target_v1, gates.clone()),
+        produced_result(outputs.clone()),
+        InMemoryBroker::with(&[("resource://output/1", RESULT_BODY)]),
+    );
+    first_req.lineage.checkpoint_version = 7;
+    let first_run = engine
+        .evaluate(first_req)
+        .await
+        .expect("first evaluation completes");
+    assert_eq!(first_run.outcome, VerificationOutcome::Accepted);
+
+    // The Loop advances to Checkpoint 8, and the workspace moved on too, so
+    // the target binding changes and the Work Unit is re-verified there.
+    let mut target_v2 = target_for(&outputs, 1);
+    target_v2.workspace_revision = Some("workspace-rev-2".to_owned());
+    let mut second_req = request(
+        plan(target_v2, gates),
+        produced_result(outputs),
+        InMemoryBroker::with(&[("resource://output/1", RESULT_BODY)]),
+    );
+    second_req.lineage.checkpoint_version = 8;
+    second_req.prior_findings = first_run.findings;
+    let second_run = engine
+        .evaluate(second_req)
+        .await
+        .expect("second evaluation completes");
+    assert_eq!(second_run.outcome, VerificationOutcome::Accepted);
+
+    // `second_run.findings` now durably carries both the Checkpoint-7 pass
+    // (stale w.r.t. Checkpoint 8's target, and recorded at an earlier
+    // Checkpoint version besides) and the fresh Checkpoint-8 pass. Neither
+    // the out-of-date version nor the superseded target may block a Loop
+    // that is, in fact, fully verified right now.
+    let assessment = assess_completion(&checkpoint(8), &second_run.findings);
+    assert!(
+        assessment.permitted,
+        "obstacles: {:?}",
+        assessment.obstacles
+    );
+    assert_eq!(
+        assessment.satisfied,
+        vec![CriterionId::new("criterion-001")]
+    );
 }
 
 #[test]

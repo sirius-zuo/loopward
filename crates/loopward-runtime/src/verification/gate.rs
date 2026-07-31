@@ -407,36 +407,44 @@ impl VerificationGate for SchemaGate {
             ));
         }
 
-        for output in &request.result.outputs {
-            let bytes = resolve(&request, output).await?;
-            let Ok(document) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-                let mut finding = request.finding(
-                    GateOutcome::Failed,
-                    "verification.schema.unparsable_output",
-                    format!(
-                        "output `{}` is not valid JSON, so it cannot satisfy contract `{}`",
-                        output.uri, config.contract.schema
-                    ),
-                );
-                finding.evidence.push(output.clone());
-                return Ok(finding);
-            };
-
-            for pointer in &config.required_pointers {
-                let present = document
-                    .pointer(pointer)
-                    .is_some_and(|value| !value.is_null());
-                if !present {
+        // Nothing is configured to check inside the output's bytes unless
+        // the plan names required pointers. A Work Unit whose declared
+        // output is plain text, Markdown, or any other non-JSON artifact
+        // must not fail a schema gate that was never configured to look at
+        // its shape — only outputs a `required_pointers` entry actually
+        // applies to are resolved and parsed at all.
+        if !config.required_pointers.is_empty() {
+            for output in &request.result.outputs {
+                let bytes = resolve(&request, output).await?;
+                let Ok(document) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
                     let mut finding = request.finding(
                         GateOutcome::Failed,
-                        "verification.schema.missing_field",
+                        "verification.schema.unparsable_output",
                         format!(
-                            "output `{}` does not carry required field `{pointer}` of contract `{}`",
+                            "output `{}` is not valid JSON, so it cannot satisfy contract `{}`'s required field(s)",
                             output.uri, config.contract.schema
                         ),
                     );
                     finding.evidence.push(output.clone());
                     return Ok(finding);
+                };
+
+                for pointer in &config.required_pointers {
+                    let present = document
+                        .pointer(pointer)
+                        .is_some_and(|value| !value.is_null());
+                    if !present {
+                        let mut finding = request.finding(
+                            GateOutcome::Failed,
+                            "verification.schema.missing_field",
+                            format!(
+                                "output `{}` does not carry required field `{pointer}` of contract `{}`",
+                                output.uri, config.contract.schema
+                            ),
+                        );
+                        finding.evidence.push(output.clone());
+                        return Ok(finding);
+                    }
                 }
             }
         }

@@ -254,14 +254,27 @@ impl VerificationEngine {
     }
 }
 
-/// Folds required gates' verdicts into one outcome (`docs/06` §7).
+/// Folds *this run's freshly evaluated* gates' verdicts into one outcome
+/// (`docs/06` §7).
 ///
 /// ```text
 /// Accepted
-/// = every required gate passed
-/// + no blocking finding remains unresolved
+/// = every required gate this run evaluated passed
+/// + no blocking finding from this run remains unresolved
 /// + target bindings are current
 /// ```
+///
+/// Deliberately scoped to `fresh` — the findings this evaluation just
+/// produced — never the full accumulated [`VerificationRun::findings`],
+/// which also carries every prior run's findings forward, including any
+/// just superseded to [`GateOutcome::Stale`] by this very evaluation. A
+/// superseded finding was already accounted for when *its own* run's
+/// outcome was computed; it is not re-litigated by a later run, and it can
+/// never count as an unresolved blocker here even though
+/// [`VerificationFinding::is_blocking`] would (correctly) call it required
+/// and non-passing in isolation. (Loop completion, which does look across
+/// every accumulated finding, is a separate decision — see
+/// [`assess_completion`].)
 ///
 /// Advisory findings are not consulted: an advisory failure is durable and
 /// visible but can neither reject a run nor hide a required pass. Failures are
@@ -413,9 +426,43 @@ pub struct CompletionAssessment {
 ///   support no particular criterion, such as a final integrity check;
 /// * evidence that actually belongs to this Loop.
 ///
+/// `findings` is expected to be exactly the durable, ever-growing record
+/// [`VerificationRun::findings`] accumulates: every prior run's findings,
+/// carried forward and marked [`GateOutcome::Stale`] once superseded, plus
+/// every fresh one. That accumulation must never make completion *less*
+/// stable over time — a criterion a *current* finding already satisfies stays
+/// satisfied no matter how many stale or out-of-date findings for the same
+/// criterion the Loop produced on the way there. Concretely: a finding that
+/// is not current (its Checkpoint version predates `checkpoint.version`, or
+/// its target has moved and it was marked [`GateOutcome::Stale`]) is inert
+/// whenever a current finding already speaks for that criterion — it can
+/// neither satisfy it nor block it. It becomes an obstacle only when it is
+/// the *sole* evidence the criterion has ever had. A current finding that
+/// failed, in contrast, always blocks its criterion outright: live evidence
+/// is never overridden by older evidence, and a live failure is never
+/// averaged away by some other gate's pass.
+///
 /// Advisory findings are never obstacles (`docs/06` §7). Absence of evidence
 /// is: a Loop with no required findings at all is not complete, it is
 /// unverified.
+///
+/// # Scope
+///
+/// This function can only judge criteria for which `findings` supplies at
+/// least one finding. It has no independent notion of *which* criteria a
+/// Checkpoint's goal declares as required: `loopward_core`'s [`Checkpoint`]
+/// is deliberately Core's identity-and-versioning view only (id, `loop_id`,
+/// version, aggregate revision, parent, episode) and structurally cannot
+/// carry a success-criteria list — that full content lives in the Checkpoint
+/// Manager's stored schema (`docs/schemas/checkpoint-v0.1.yaml`:
+/// `goal.success_criteria`), which has no Rust type in this crate yet. A
+/// required criterion with **zero** evidence ever produced for it is
+/// therefore invisible here and will never appear among `obstacles`.
+/// Detecting that case is a later caller's job, once it holds the
+/// authoritative required-criteria set to compare `findings` against (the
+/// Loop Controller, a later task) — `permitted: true` from this function
+/// alone is not proof that every criterion the Checkpoint requires has been
+/// addressed, only that nothing it *was given evidence about* is unresolved.
 #[must_use]
 pub fn assess_completion(
     checkpoint: &Checkpoint,
@@ -423,7 +470,8 @@ pub fn assess_completion(
 ) -> CompletionAssessment {
     let mut obstacles = Vec::new();
     let mut passing: BTreeSet<CriterionId> = BTreeSet::new();
-    let mut gaps: BTreeMap<CriterionId, EvidenceGap> = BTreeMap::new();
+    let mut current_gaps: BTreeMap<CriterionId, EvidenceGap> = BTreeMap::new();
+    let mut historical_gaps: BTreeMap<CriterionId, EvidenceGap> = BTreeMap::new();
     let mut supported = false;
 
     for finding in findings
@@ -438,40 +486,68 @@ pub fn assess_completion(
             continue;
         }
 
-        let gap = if finding.lineage.checkpoint_version == checkpoint.version {
-            match finding.outcome {
-                GateOutcome::Passed => None,
-                GateOutcome::Failed => Some(EvidenceGap::Failed),
-                GateOutcome::Inconclusive => Some(EvidenceGap::Inconclusive),
-                GateOutcome::Suspended => Some(EvidenceGap::Suspended),
-                GateOutcome::Stale => Some(EvidenceGap::Stale),
-            }
-        } else {
-            Some(EvidenceGap::NotCurrent)
-        };
+        // "Current" means both at once: recorded at the Checkpoint version
+        // in force, and not superseded by a moved target. Anything else is
+        // historical — evidence from a point the Loop has since moved past
+        // — and historical evidence must never permanently block a
+        // criterion that a current finding already satisfies.
+        let is_current = finding.lineage.checkpoint_version == checkpoint.version
+            && finding.outcome != GateOutcome::Stale;
 
-        match (gap, finding.criterion.clone()) {
-            (None, criterion) => {
+        if is_current {
+            if finding.outcome == GateOutcome::Passed {
                 supported = true;
-                if let Some(criterion) = criterion {
+                if let Some(criterion) = finding.criterion.clone() {
                     passing.insert(criterion);
                 }
+                continue;
             }
-            (Some(gap), Some(criterion)) => {
-                gaps.entry(criterion).or_insert(gap);
+            let gap = current_gap(finding.outcome);
+            match finding.criterion.clone() {
+                Some(criterion) => {
+                    current_gaps.entry(criterion).or_insert(gap);
+                }
+                None => obstacles.push(CompletionObstacle::BlockingFinding {
+                    gate_id: finding.gate_id.clone(),
+                    code: finding.code.clone(),
+                    gap,
+                }),
             }
-            (Some(gap), None) => obstacles.push(CompletionObstacle::BlockingFinding {
-                gate_id: finding.gate_id.clone(),
-                code: finding.code.clone(),
-                gap,
-            }),
+            continue;
+        }
+
+        // Historical: has no bearing on completion unless it turns out to be
+        // the only evidence its criterion ever had.
+        if let Some(criterion) = finding.criterion.clone() {
+            let gap = if finding.lineage.checkpoint_version == checkpoint.version {
+                // Version matches, so `is_current` was false only because
+                // the target moved out from under this finding.
+                EvidenceGap::Stale
+            } else {
+                EvidenceGap::NotCurrent
+            };
+            historical_gaps.entry(criterion).or_insert(gap);
         }
     }
 
-    // A criterion with any unresolved gap is unsatisfied, even if another
-    // gate passed for it: a failure is never averaged away by a pass.
-    for (criterion, gap) in gaps {
-        passing.remove(&criterion);
+    // A criterion with a *current* unresolved gap is unsatisfied, even if
+    // another gate passed for it: live evidence is never averaged away by a
+    // pass (`docs/06` §7).
+    for (criterion, gap) in &current_gaps {
+        passing.remove(criterion);
+        obstacles.push(CompletionObstacle::CriterionUnsupported {
+            criterion: criterion.clone(),
+            gap: *gap,
+        });
+    }
+
+    // Historical evidence is inert once a current finding — passing or
+    // failing — already speaks for the same criterion; it becomes an
+    // obstacle only when it is the sole evidence on record.
+    for (criterion, gap) in historical_gaps {
+        if passing.contains(&criterion) || current_gaps.contains_key(&criterion) {
+            continue;
+        }
         obstacles.push(CompletionObstacle::CriterionUnsupported { criterion, gap });
     }
 
@@ -485,6 +561,23 @@ pub fn assess_completion(
         checkpoint_version: checkpoint.version,
         satisfied: passing.into_iter().collect(),
         obstacles,
+    }
+}
+
+/// Maps a current, non-passing required finding's outcome to the gap it
+/// leaves in its criterion's evidence.
+///
+/// Never called with [`GateOutcome::Passed`] (the caller handles that case
+/// before reaching here) or [`GateOutcome::Stale`] (excluded from "current"
+/// by definition), so those arms are unreachable.
+fn current_gap(outcome: GateOutcome) -> EvidenceGap {
+    match outcome {
+        GateOutcome::Failed => EvidenceGap::Failed,
+        GateOutcome::Inconclusive => EvidenceGap::Inconclusive,
+        GateOutcome::Suspended => EvidenceGap::Suspended,
+        GateOutcome::Passed | GateOutcome::Stale => {
+            unreachable!("current_gap is only called for a current, non-passing finding")
+        }
     }
 }
 

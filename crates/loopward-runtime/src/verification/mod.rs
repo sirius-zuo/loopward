@@ -520,11 +520,23 @@ impl VerificationFinding {
         self.outcome != GateOutcome::Stale && self.target_digest == target.binding_digest()
     }
 
-    /// Whether this finding blocks acceptance.
+    /// Whether this finding, taken alone, is a required verdict that did not
+    /// pass.
     ///
     /// Only required gates block, and only when they did not pass. An
     /// advisory failure is durable and visible but never blocking
     /// (`docs/06` §7).
+    ///
+    /// This is a property of one finding in isolation: it says nothing about
+    /// whether a *later* finding has since superseded this one. A caller
+    /// looking at a durable, accumulated list — such as
+    /// [`VerificationRun::findings`], which carries every prior run's
+    /// findings forward — must decide for itself whether a superseded
+    /// finding still matters. The engine's own aggregation step never sees
+    /// one: it consults only the findings one run just produced. In
+    /// contrast, [`assess_completion`] does look across the whole
+    /// accumulated record, and treats a finding a current one has superseded
+    /// as inert rather than as still blocking.
     #[must_use]
     pub fn is_blocking(&self) -> bool {
         self.enforcement.is_required() && !self.outcome.is_passing()
