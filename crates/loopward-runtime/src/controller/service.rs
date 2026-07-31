@@ -35,10 +35,12 @@ use loopward_core::{AggregateState, LoopStatus as CoreLoopStatus, work_unit_stat
 
 use crate::controller::{ControllerError, LoopController};
 use crate::ports::{RecordedEvent, StoreError};
+use crate::recovery::RecoveryManager;
 
 /// The public `LoopService` adapter over [`LoopController`].
 pub struct RuntimeLoopService {
     controller: LoopController,
+    recovery: RecoveryManager,
     operations: Mutex<HashMap<String, OperationHandle>>,
 }
 
@@ -53,6 +55,7 @@ impl RuntimeLoopService {
     #[must_use]
     pub fn new(controller: LoopController) -> Self {
         Self {
+            recovery: RecoveryManager::new(controller.clone()),
             controller,
             operations: Mutex::new(HashMap::new()),
         }
@@ -361,6 +364,27 @@ impl loopward_api::loop_service::LoopService for RuntimeLoopService {
         Ok(handle)
     }
 
+    /// Resumes a suspended Loop, then reconciles any leftover unreconciled
+    /// state before returning.
+    ///
+    /// [`LoopController::resume`] is deliberately a bare status flip
+    /// (`Suspended -> Active`) and does not itself reconcile what the
+    /// suspended Episode left behind. Two gaps that flip alone cannot close
+    /// (Task 9's own flagged scope for Task 10):
+    ///
+    /// 1. a Work Unit left at `WorkUnitStatus::Suspended` by a prior
+    ///    `VerificationOutcome::Suspended` outcome has no `LifecycleCommand`
+    ///    that clears it, so the next `advance` would find a Work Unit
+    ///    status `prepare_attempt` never accepts and error permanently;
+    /// 2. an unreconciled Attempt left non-terminal by the same suspension
+    ///    would make the next `StartEpisode`/`StartSession` fail the
+    ///    reducer's `attempt.reconciled_before_next_generation` invariant.
+    ///
+    /// Calling [`RecoveryManager::recover`] immediately after the flip
+    /// closes both: it reconciles the dangling Attempt (asking the runner
+    /// before assuming the external effect is safe to retire) and returns
+    /// the Work Unit to `Pending`, so the Loop this call hands back is
+    /// actually ready to `advance`, not merely `Active` in name.
     async fn resume(&self, command: ResumeLoopCommand) -> Result<OperationHandle, LoopwardError> {
         if let Some(existing) = self.previously_accepted(&command.metadata.idempotency_key) {
             return Ok(existing);
@@ -371,6 +395,9 @@ impl loopward_api::loop_service::LoopService for RuntimeLoopService {
 
         self.controller
             .resume(command.loop_id)
+            .await
+            .map_err(controller_error)?;
+        Box::pin(self.recovery.recover(command.loop_id))
             .await
             .map_err(controller_error)?;
 

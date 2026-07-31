@@ -87,8 +87,8 @@ use loopward_api::trace::TraceContext;
 use loopward_api::work_unit::{WorkUnit, WorkUnitRequest, WorkUnitResult};
 use loopward_core::{
     AggregateState, Checkpoint, DomainError, EffectivePolicy, EpisodeKind, LifecycleCommand,
-    LoopEvent, LoopStatus, RotationReason, decide, evolve, validate_invariants,
-    work_unit_status_is_terminal,
+    LoopEvent, LoopStatus, RotationReason, VerificationOutcome, decide, evolve,
+    validate_invariants, work_unit_status_is_terminal,
 };
 
 use crate::context::ContextCandidate;
@@ -426,6 +426,42 @@ impl LoopController {
     #[must_use]
     pub fn holder_id(&self) -> RuntimeInstanceId {
         self.holder_id
+    }
+
+    /// The runner this controller invokes Work Unit Attempts through.
+    ///
+    /// `pub(crate)`: [`crate::recovery::RecoveryManager`] reconciles the same
+    /// runner's in-flight or ambiguous runs after a crash, and reuses this
+    /// controller's configuration rather than requiring its own copy.
+    #[must_use]
+    pub(crate) fn runner(&self) -> &Arc<dyn WorkUnitRunner> {
+        &self.runner
+    }
+
+    /// The lease TTL this controller acquires for each durable operation.
+    #[must_use]
+    pub(crate) fn lease_ttl(&self) -> time::Duration {
+        self.lease_ttl
+    }
+
+    /// The hydrator this controller re-hydrates Boot Packages through.
+    #[must_use]
+    pub(crate) fn hydrator(&self) -> &crate::ContextHydrator {
+        &self.hydrator
+    }
+
+    /// The context candidate provider this controller offers to the
+    /// hydrator.
+    #[must_use]
+    pub(crate) fn candidates(&self) -> &Arc<dyn ContextCandidateProvider> {
+        &self.candidates
+    }
+
+    /// The recorded context selection rule version this controller hydrates
+    /// under.
+    #[must_use]
+    pub(crate) fn context_rule_version(&self) -> &str {
+        &self.context_rule_version
     }
 
     /// Requests `loop_id` suspend at its current safe boundary
@@ -951,13 +987,49 @@ impl LoopController {
             return Ok(OperationOutcome::Suspended);
         };
 
+        self.finish_execution_attempt(
+            loop_id,
+            lease,
+            state,
+            episode_id,
+            hydration_request,
+            report.manifest.pinned_digest.clone(),
+            collected,
+            soft_context_budget,
+        )
+        .await
+    }
+
+    /// Drains a collected result to a committed Episode boundary: the
+    /// drain-time pinned-integrity re-check, finalizing and recording the
+    /// result, and the closing rotation and Checkpoint commit.
+    ///
+    /// Factored out of [`Self::run_execution_episode`]'s tail. `pub(crate)`:
+    /// shared with [`crate::recovery::RecoveryManager`], which reaches this
+    /// exact tail after reconciling a runner that turns out to have already
+    /// completed (or re-collecting from one that has) — the drained result
+    /// still has to survive the identical integrity check before it may
+    /// commit, whether the Attempt was reconciled after a crash or collected
+    /// on the normal path.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn finish_execution_attempt(
+        &self,
+        loop_id: LoopId,
+        lease: &LoopLease,
+        state: AggregateState,
+        episode_id: EpisodeId,
+        hydration_request: HydrationRequest,
+        original_pinned_digest: String,
+        collected: WorkUnitResult,
+        soft_context_budget: bool,
+    ) -> Result<OperationOutcome, ControllerError> {
         // Drain-time integrity re-check: pinned constraints must survive
         // hydration and drain losslessly. Re-hydrating the same request and
         // comparing pinned digests detects pinned state that moved
         // underneath the run; a divergence means the drained result cannot
         // commit (`docs/07` §11, Global Constraints).
         let redrawn = self.hydrator.hydrate(hydration_request).await?;
-        if redrawn.manifest.pinned_digest != report.manifest.pinned_digest {
+        if redrawn.manifest.pinned_digest != original_pinned_digest {
             let state = self
                 .apply(
                     loop_id,
@@ -1070,56 +1142,14 @@ impl LoopController {
             )
             .await?;
 
-        let template = self
-            .plans
-            .resolve(&work_unit.verification_plan)
-            .ok_or_else(|| {
-                ControllerError::UnknownVerificationPlan(
-                    work_unit.verification_plan.reference.clone(),
-                )
-            })?;
-
-        let result_bytes = self.ports.resources.resolve(&result_ref).await?;
-        let result: WorkUnitResult = serde_json::from_slice(&result_bytes)?;
-
-        let target = VerificationTarget {
-            work_unit_id: work_unit.id,
-            result_digest: Digest::new(result_ref.digest.clone().unwrap_or_default()),
-            resource_digests: BTreeMap::new(),
-            workspace_revision: None,
-            plan_version: template.version,
-            constraint_digest: None,
-        };
-        let plan = VerificationPlan {
-            id: template.id,
-            version: template.version,
-            target,
-            gates: template.gates,
-            aggregation: template.aggregation,
-            remediation_policy: template.remediation_policy,
-        };
-        let plan_id = plan.id.clone();
-        let plan_version = plan.version;
-
-        let lineage = FindingLineage {
-            loop_id,
-            work_unit_id: work_unit.id,
-            attempt_id: attempt.id,
-            plan_id,
-            plan_version,
-            checkpoint_version: state.checkpoint.version,
-        };
-
-        let run = self
-            .verification
-            .evaluate(VerificationRequest {
-                plan,
-                result: Arc::new(result),
-                lineage,
-                prior_findings: Vec::new(),
-                resources: Arc::clone(&self.ports.resources),
-                observed_at: self.ports.clock.now(),
-            })
+        let outcome = self
+            .evaluate_verification(
+                loop_id,
+                state.checkpoint.version,
+                &work_unit,
+                &attempt,
+                &result_ref,
+            )
             .await?;
 
         let state = self
@@ -1127,9 +1157,7 @@ impl LoopController {
                 loop_id,
                 lease,
                 &state,
-                LifecycleCommand::RecordVerification {
-                    outcome: run.outcome,
-                },
+                LifecycleCommand::RecordVerification { outcome },
             )
             .await?;
 
@@ -1167,7 +1195,13 @@ impl LoopController {
     // Shared step helpers
     // -----------------------------------------------------------------
 
-    fn resolve_context_budget(&self, requested: Option<ContextBudgetRequest>) -> ContextBudget {
+    /// `pub(crate)`: shared with [`crate::recovery::RecoveryManager`], which
+    /// must resolve the identical budget a crashed Episode was hydrated
+    /// under before it can safely redo the drain-time integrity check.
+    pub(crate) fn resolve_context_budget(
+        &self,
+        requested: Option<ContextBudgetRequest>,
+    ) -> ContextBudget {
         let requested = requested.unwrap_or_default();
         ContextBudget {
             model_window_tokens: self.default_budget.model_window_tokens,
@@ -1183,7 +1217,10 @@ impl LoopController {
         }
     }
 
-    async fn mark_hydrated(
+    /// `pub(crate)`: shared with [`crate::recovery::RecoveryManager`], which
+    /// redoes hydration exactly the same way when a crash happened before
+    /// `context.hydrated` was durably recorded.
+    pub(crate) async fn mark_hydrated(
         &self,
         loop_id: LoopId,
         lease: &LoopLease,
@@ -1200,6 +1237,78 @@ impl LoopController {
             },
         )
         .await
+    }
+
+    /// Builds a [`VerificationPlan`] for `work_unit`'s declared reference and
+    /// evaluates `result_ref` against it, returning the outcome.
+    ///
+    /// `pub(crate)` and factored out of [`Self::run_verification_episode`]:
+    /// shared with [`crate::recovery::RecoveryManager`], which redoes
+    /// Loopward's own verification judgement from scratch when a crash
+    /// happened before `verification.completed` was durably recorded
+    /// (`docs/06-verification-and-recovery.md` §12) — verification is a pure
+    /// Loopward computation over durable inputs, so redoing it is always
+    /// safe, unlike blindly repeating a runner's external effect.
+    pub(crate) async fn evaluate_verification(
+        &self,
+        loop_id: LoopId,
+        checkpoint_version: u64,
+        work_unit: &WorkUnit,
+        attempt: &loopward_core::WorkUnitAttempt,
+        result_ref: &ResourceRef,
+    ) -> Result<VerificationOutcome, ControllerError> {
+        let template = self
+            .plans
+            .resolve(&work_unit.verification_plan)
+            .ok_or_else(|| {
+                ControllerError::UnknownVerificationPlan(
+                    work_unit.verification_plan.reference.clone(),
+                )
+            })?;
+
+        let result_bytes = self.ports.resources.resolve(result_ref).await?;
+        let result: WorkUnitResult = serde_json::from_slice(&result_bytes)?;
+
+        let target = VerificationTarget {
+            work_unit_id: work_unit.id,
+            result_digest: Digest::new(result_ref.digest.clone().unwrap_or_default()),
+            resource_digests: BTreeMap::new(),
+            workspace_revision: None,
+            plan_version: template.version,
+            constraint_digest: None,
+        };
+        let plan = VerificationPlan {
+            id: template.id,
+            version: template.version,
+            target,
+            gates: template.gates,
+            aggregation: template.aggregation,
+            remediation_policy: template.remediation_policy,
+        };
+        let plan_id = plan.id.clone();
+        let plan_version = plan.version;
+
+        let lineage = FindingLineage {
+            loop_id,
+            work_unit_id: work_unit.id,
+            attempt_id: attempt.id,
+            plan_id,
+            plan_version,
+            checkpoint_version,
+        };
+
+        let run = self
+            .verification
+            .evaluate(VerificationRequest {
+                plan,
+                result: Arc::new(result),
+                lineage,
+                prior_findings: Vec::new(),
+                resources: Arc::clone(&self.ports.resources),
+                observed_at: self.ports.clock.now(),
+            })
+            .await?;
+        Ok(run.outcome)
     }
 
     async fn finalize_manifest(
@@ -1221,7 +1330,10 @@ impl LoopController {
         Ok(resource_ref)
     }
 
-    async fn finalize_result(
+    /// `pub(crate)`: shared with [`crate::recovery::RecoveryManager`], which
+    /// finalizes a freshly re-collected result exactly the same way a
+    /// normal Episode does.
+    pub(crate) async fn finalize_result(
         &self,
         result: &WorkUnitResult,
     ) -> Result<ResourceRef, ControllerError> {
@@ -1244,7 +1356,16 @@ impl LoopController {
     /// the resulting events. Returns the locally folded state rather than
     /// the store's returned projection — see the module documentation's
     /// note on the `LoopStore::append` projection gap.
-    async fn apply(
+    ///
+    /// `pub(crate)`: this is the one `decide -> evolve -> validate_invariants
+    /// -> single fenced store write` pattern every mutation in this crate
+    /// uses (Global Constraints: "every state mutation MUST use optimistic
+    /// concurrency and lease fencing"). [`crate::recovery::RecoveryManager`]
+    /// reuses it verbatim rather than re-implementing the same fencing and
+    /// validation for the reconciling commands recovery already has a
+    /// `LifecycleCommand` for (e.g. `RequestRotation`, `RecordResult`,
+    /// `RecordVerification`, `Suspend`).
+    pub(crate) async fn apply(
         &self,
         loop_id: LoopId,
         lease: &LoopLease,
@@ -1267,7 +1388,10 @@ impl LoopController {
 
     /// Decides and evolves a [`LifecycleCommand::CommitCheckpoint`] against
     /// `state`, then atomically commits it.
-    async fn commit(
+    ///
+    /// `pub(crate)`: shared with [`crate::recovery::RecoveryManager`] for the
+    /// same reason as [`Self::apply`].
+    pub(crate) async fn commit(
         &self,
         loop_id: LoopId,
         lease: &LoopLease,
@@ -1302,7 +1426,15 @@ impl LoopController {
 
     /// Builds the next Checkpoint for `episode_id`, continuing from
     /// `state.checkpoint`.
-    fn build_checkpoint(&self, state: &AggregateState, episode_id: EpisodeId) -> Checkpoint {
+    ///
+    /// `pub(crate)`: shared with [`crate::recovery::RecoveryManager`], which
+    /// mints Checkpoints through the identical helper when it finishes an
+    /// Episode a crash interrupted.
+    pub(crate) fn build_checkpoint(
+        &self,
+        state: &AggregateState,
+        episode_id: EpisodeId,
+    ) -> Checkpoint {
         let digest = crate::context::content_digest(
             serde_json::to_vec(state).unwrap_or_default().as_slice(),
         );
@@ -1319,7 +1451,11 @@ impl LoopController {
 
     /// Requests a normal (non-failure) rotation and commits the resulting
     /// terminal Checkpoint for this Episode.
-    async fn rotate_and_commit(
+    ///
+    /// `pub(crate)`: shared with [`crate::recovery::RecoveryManager`], which
+    /// finishes an interrupted Episode's normal rotation the same way a
+    /// completed `advance` call would have.
+    pub(crate) async fn rotate_and_commit(
         &self,
         loop_id: LoopId,
         lease: &LoopLease,
@@ -1352,7 +1488,11 @@ impl LoopController {
     /// others do not (a runner that never even started, or a normal
     /// rotation whose drain turned out to be compromised). Checking rather
     /// than assuming keeps this one helper correct for both.
-    async fn ensure_episode_terminal_and_commit(
+    ///
+    /// `pub(crate)`: shared with [`crate::recovery::RecoveryManager`], which
+    /// closes out an interrupted Episode into `Suspended` through the
+    /// identical path a graceful in-process failure already uses.
+    pub(crate) async fn ensure_episode_terminal_and_commit(
         &self,
         loop_id: LoopId,
         lease: &LoopLease,

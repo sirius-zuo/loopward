@@ -14,6 +14,7 @@
 pub mod context;
 pub mod controller;
 pub mod ports;
+pub mod recovery;
 pub mod rotation;
 pub mod verification;
 
@@ -27,5 +28,6 @@ pub use ports::{
     LoopStore, RecordedEvent, ResourceBeginHint, ResourceBroker, ResourceError, ResourceHandle,
     RuntimeInstanceId, RuntimePorts, StoreError, StoredLoop,
 };
+pub use recovery::{EpisodeRecoveryOutcome, RecoveryManager, RecoveryOutcome};
 pub use rotation::{RotationContext, RotationDecision, RotationPolicy, RotationSignal};
 pub use verification::{VerificationEngine, VerificationFinding};
