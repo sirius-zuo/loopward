@@ -12,13 +12,20 @@
 //! actually drives an Episode forward is built on top of them separately.
 
 pub mod context;
+pub mod controller;
 pub mod ports;
+pub mod rotation;
 pub mod verification;
 
 pub use context::{ContextHydrator, HydrationError, HydrationReport, HydrationRequest};
+pub use controller::{
+    ContextCandidateProvider, ControllerError, LoopController, OperationOutcome,
+    RuntimeLoopService, VerificationPlanResolver, VerificationPlanTemplate,
+};
 pub use ports::{
     AcquireLease, CheckpointCommitRequest, Clock, EVENT_SCHEMA_VERSION, IdGenerator, LoopLease,
     LoopStore, RecordedEvent, ResourceBeginHint, ResourceBroker, ResourceError, ResourceHandle,
     RuntimeInstanceId, RuntimePorts, StoreError, StoredLoop,
 };
+pub use rotation::{RotationContext, RotationDecision, RotationPolicy, RotationSignal};
 pub use verification::{VerificationEngine, VerificationFinding};
