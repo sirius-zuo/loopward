@@ -13,14 +13,50 @@
 //! only. A real OpenTelemetry-backed sink belongs in the separate
 //! `loopward-observability-otel` crate; `loopward-runtime` depends on this
 //! crate's trait and must never redeclare it.
+//!
+//! # From one flat event to spans
+//!
+//! Task 4 established [`TelemetryEvent`]: one flat, spanless fact, with its
+//! own doc comment already naming the tradeoff — "deliberately generic
+//! rather than modeling full `OpenTelemetry` spans". Task 11 needs real span
+//! semantics: start/end pairs, parent/child nesting, and the causal links
+//! `docs/08` §7 names (`continuation_of`, `retry_of`, `recovery_of`,
+//! `remediation_of`, `external_execution`) — none of which a one-shot event
+//! can express. Rather than replacing [`TelemetryEvent`] (still the right
+//! shape for a bare diagnostic fact with no span of its own — see [`events`]
+//! for the stable names `docs/08` §9 assigns them), this crate *extends*
+//! [`TelemetrySink`] with span methods alongside it: [`spans::SpanStart`]/
+//! [`spans::SpanEnd`] describe one span's start and end, [`spans::SpanLink`]
+//! carries a causal link, and [`spans::Span`] is an RAII guard that lets
+//! `loopward-runtime` wrap an *existing* call sequence in a span without
+//! restructuring its control flow (`?` and early returns still end the span
+//! exactly once, via `Drop`).
+//!
+//! Every new trait method carries a default implementation that does
+//! nothing and returns the cheapest possible handle
+//! ([`spans::SpanHandle::disabled`]) — so [`NoopTelemetrySink`] did not need
+//! to change at all to pick them up, and stays what it always was: a
+//! legitimate, zero-cost production configuration with tracing disabled.
 
-/// One structured fact the runtime wants to record as telemetry.
+pub mod attributes;
+pub mod events;
+pub mod recorder;
+pub mod spans;
+
+pub use attributes::attribute;
+pub use events::event_name;
+
+use spans::{SpanEnd, SpanHandle, SpanStart};
+
+/// One structured fact the runtime wants to record as telemetry, with no
+/// span of its own.
 ///
 /// Deliberately generic rather than modeling full `OpenTelemetry` spans:
 /// Phase One "supports `OpenTelemetry`-compatible tracing" (§3) through a
 /// dedicated adapter crate, but the contract a correctness-critical runtime
 /// depends on must stay small enough that [`NoopTelemetrySink`] can satisfy
-/// it with no observable effect.
+/// it with no observable effect. See [`spans`] for span-shaped telemetry
+/// (start/end, nesting, causal links).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TelemetryEvent {
     /// A stable, dotted event name (e.g. `"episode.started"`), matching the
@@ -55,9 +91,47 @@ impl TelemetryEvent {
 /// doing anything observable: every call site treats emission as
 /// best-effort and side-channel only, and [`NoopTelemetrySink`] is a
 /// legitimate production configuration.
+///
+/// The span methods all carry default implementations that do nothing and
+/// return [`SpanHandle::disabled`]: an implementor that only ever cared
+/// about flat events (like [`NoopTelemetrySink`]) needs no changes at all,
+/// and picks up "tracing disabled" behavior for free.
 pub trait TelemetrySink: Send + Sync {
-    /// Records one telemetry event.
+    /// Records one telemetry event with no span of its own.
     fn record(&self, event: TelemetryEvent);
+
+    /// Starts a new span, returning a handle for [`Self::end_span`] and for
+    /// use as another span's parent or link target.
+    ///
+    /// Must never block or panic: a telemetry outage must not stop Loop
+    /// progress (`docs/08-tracing-and-observability.md` §13).
+    fn start_span(&self, start: SpanStart) -> SpanHandle {
+        let _ = start;
+        SpanHandle::disabled()
+    }
+
+    /// Ends a span previously returned by [`Self::start_span`].
+    ///
+    /// Must never block or panic, for the same reason as [`Self::start_span`].
+    fn end_span(&self, handle: SpanHandle, end: SpanEnd) {
+        let _ = (handle, end);
+    }
+
+    /// Attaches one diagnostic event to a currently open span
+    /// (`docs/08` §9). The durable event journal remains authoritative;
+    /// this is a diagnostic copy only.
+    fn span_event(&self, handle: &SpanHandle, event: TelemetryEvent) {
+        let _ = (handle, event);
+    }
+
+    /// Resolves the W3C trace context to propagate across a runner boundary
+    /// for the span `handle` names (`docs/08` §8), for attaching to a
+    /// `WorkUnitRequest`. Returns an empty context when tracing is disabled
+    /// or the sink does not support propagation.
+    fn trace_context(&self, handle: &SpanHandle) -> loopward_api::trace::TraceContext {
+        let _ = handle;
+        loopward_api::trace::TraceContext::default()
+    }
 }
 
 /// A [`TelemetrySink`] that discards every event.

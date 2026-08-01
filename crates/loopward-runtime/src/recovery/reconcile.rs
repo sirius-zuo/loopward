@@ -847,6 +847,7 @@ impl RecoveryManager {
                     &work_unit,
                     &attempt,
                     &result_ref,
+                    None,
                 )
                 .await?;
             let state = self

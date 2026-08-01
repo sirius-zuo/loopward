@@ -9,3 +9,4 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+loopward-api = { path = "../loopward-api" }

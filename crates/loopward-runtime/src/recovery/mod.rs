@@ -65,6 +65,8 @@ use loopward_core::{
     AggregateState, AttemptStatus, Checkpoint, LoopEvent, WorkUnitAttempt, WorkUnitStatus,
     validate_invariants, work_unit_status_is_terminal,
 };
+use loopward_observability::attribute;
+use loopward_observability::spans::{Span, SpanLink, SpanLinkKind, SpanStart, span_name};
 
 use crate::HydrationRequest;
 use crate::controller::{ControllerError, LoopController};
@@ -198,29 +200,47 @@ impl RecoveryManager {
         let stored = self.controller.ports().store.load(loop_id).await?;
         let state = stored.state;
 
+        let mut start = SpanStart::new(span_name::RECOVERY_RECONCILE)
+            .with_attribute(attribute::LOOP_ID, loop_id.to_string());
+        if let Some(trace_id) = state
+            .episode
+            .as_ref()
+            .and_then(|episode| episode.trace_id.clone())
+        {
+            start = start.with_link(SpanLink::new(SpanLinkKind::RecoveryOf, trace_id));
+        }
+        let mut span = Span::start(&self.controller.ports().telemetry, start);
+
         if state.execution.status.is_terminal() {
+            span.set_end_attribute(attribute::RECOVERY_OUTCOME, "nothing_to_recover");
             return Ok(RecoveryOutcome::NothingToRecover);
         }
 
         if state.active_episode().is_none() {
-            return self
+            let outcome = self
                 .reconcile_without_active_episode(loop_id, &lease, state)
                 .await;
+            record_recovery_outcome(&mut span, &outcome);
+            return outcome;
         }
 
-        match Box::pin(self.reconcile_active_episode(loop_id, &lease, state)).await? {
-            EpisodeRecoveryOutcome::Reattached => Ok(RecoveryOutcome::Reattached),
-            EpisodeRecoveryOutcome::Completed {
-                episode_id,
-                checkpoint_version,
-            } => Ok(RecoveryOutcome::EpisodeRecovered {
-                episode_id,
-                checkpoint_version,
-            }),
-            EpisodeRecoveryOutcome::Suspended { reason } => {
-                Ok(RecoveryOutcome::LoopSuspended { reason })
-            }
-        }
+        let outcome = Box::pin(self.reconcile_active_episode(loop_id, &lease, state))
+            .await
+            .map(|episode_outcome| match episode_outcome {
+                EpisodeRecoveryOutcome::Reattached => RecoveryOutcome::Reattached,
+                EpisodeRecoveryOutcome::Completed {
+                    episode_id,
+                    checkpoint_version,
+                } => RecoveryOutcome::EpisodeRecovered {
+                    episode_id,
+                    checkpoint_version,
+                },
+                EpisodeRecoveryOutcome::Suspended { reason } => {
+                    RecoveryOutcome::LoopSuspended { reason }
+                }
+            });
+        record_recovery_outcome(&mut span, &outcome);
+        outcome
     }
 
     /// Reconciles a Loop whose most recent Episode already terminated
@@ -529,5 +549,47 @@ impl RecoveryManager {
             })
             .await?;
         Ok(())
+    }
+}
+
+/// Records the disposition of one [`RecoveryManager::recover`] call onto its
+/// `loopward.recovery.reconcile` span (`docs/08-tracing-and-observability.md`
+/// §6's `loopward.recovery.outcome`), distinguishing a business disposition
+/// (still suspended, reattached, recovered) from a genuine transport/store
+/// error (§10).
+fn record_recovery_outcome(span: &mut Span, outcome: &Result<RecoveryOutcome, ControllerError>) {
+    match outcome {
+        Ok(RecoveryOutcome::NothingToRecover) => {
+            span.set_end_attribute(attribute::RECOVERY_OUTCOME, "nothing_to_recover");
+        }
+        Ok(RecoveryOutcome::WorkUnitReadyForRetry) => {
+            span.set_end_attribute(attribute::RECOVERY_OUTCOME, "work_unit_ready_for_retry");
+        }
+        Ok(RecoveryOutcome::AttemptResultRecovered) => {
+            span.set_end_attribute(attribute::RECOVERY_OUTCOME, "attempt_result_recovered");
+        }
+        Ok(RecoveryOutcome::StillSuspended { reason }) => {
+            span.set_end_attribute(attribute::RECOVERY_OUTCOME, "still_suspended");
+            span.set_end_attribute(attribute::SUSPENSION_CODE, format!("{reason:?}"));
+        }
+        Ok(RecoveryOutcome::EpisodeRecovered {
+            episode_id,
+            checkpoint_version,
+        }) => {
+            span.set_end_attribute(attribute::RECOVERY_OUTCOME, "episode_recovered");
+            span.set_end_attribute(attribute::EPISODE_ID, episode_id.to_string());
+            span.set_end_attribute(
+                attribute::CHECKPOINT_VERSION,
+                checkpoint_version.to_string(),
+            );
+        }
+        Ok(RecoveryOutcome::Reattached) => {
+            span.set_end_attribute(attribute::RECOVERY_OUTCOME, "reattached");
+        }
+        Ok(RecoveryOutcome::LoopSuspended { reason }) => {
+            span.set_end_attribute(attribute::RECOVERY_OUTCOME, "loop_suspended");
+            span.set_end_attribute(attribute::SUSPENSION_CODE, format!("{reason:?}"));
+        }
+        Err(err) => span.set_error("controller_error", err.to_string()),
     }
 }

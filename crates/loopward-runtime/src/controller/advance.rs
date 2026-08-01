@@ -73,8 +73,8 @@
 //! projection the next `advance()` call correctly recognizes as needing
 //! recovery.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex};
 
 use loopward_api::context::{
     BootPackageManifest, ContextBudget, ContextBudgetRequest, ContextClass, ContextPriority,
@@ -83,12 +83,15 @@ use loopward_api::ids::{EpisodeId, LoopId};
 use loopward_api::loop_service::{RunCondition, RunLimits};
 use loopward_api::resource::{OpaqueRef, ResourceRef, VerificationPlanRef};
 use loopward_api::runner::{RunnerError, SuspensionReason, WorkUnitRunner};
-use loopward_api::trace::TraceContext;
 use loopward_api::work_unit::{WorkUnit, WorkUnitRequest, WorkUnitResult};
 use loopward_core::{
     AggregateState, Checkpoint, DomainError, EffectivePolicy, EpisodeKind, LifecycleCommand,
     LoopEvent, LoopStatus, RotationReason, VerificationOutcome, decide, evolve,
     validate_invariants, work_unit_status_is_terminal,
+};
+use loopward_observability::attribute;
+use loopward_observability::spans::{
+    Span, SpanContext, SpanLink, SpanLinkKind, SpanStart, span_name,
 };
 
 use crate::context::ContextCandidate;
@@ -317,6 +320,13 @@ pub struct LoopController {
     context_rule_version: String,
     default_budget: ContextBudget,
     lease_ttl: time::Duration,
+    /// The most recently started Episode trace per Loop, used to link a new
+    /// Episode's root span to its predecessor's
+    /// (`docs/08-tracing-and-observability.md` §4, §7:
+    /// `continuation_of`). Best-effort and in-process only: tracing is not
+    /// the recovery path (§13), so losing this on a process restart only
+    /// loses a continuation *link*, never Loop progress or correctness.
+    trace_continuity: Arc<Mutex<HashMap<LoopId, SpanContext>>>,
 }
 
 impl std::fmt::Debug for LoopController {
@@ -361,6 +371,7 @@ impl LoopController {
                 safety_margin_tokens: 500,
             },
             lease_ttl: time::Duration::seconds(60),
+            trace_continuity: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -830,9 +841,11 @@ impl LoopController {
         &self,
         loop_id: LoopId,
         lease: &LoopLease,
-        state: AggregateState,
+        mut state: AggregateState,
         episode_id: EpisodeId,
     ) -> Result<OperationOutcome, ControllerError> {
+        let mut episode_span = self.open_episode_span(loop_id, episode_id, &mut state);
+
         let work_unit = state
             .work_unit
             .clone()
@@ -853,7 +866,22 @@ impl LoopController {
             candidates: self.candidates.candidates(&work_unit, &state.checkpoint),
         };
 
+        let hydrate_span = Span::start(
+            &self.ports.telemetry,
+            episode_span
+                .context()
+                .cloned()
+                .map_or_else(
+                    || SpanStart::new(span_name::CONTEXT_HYDRATE),
+                    |parent| SpanStart::new(span_name::CONTEXT_HYDRATE).with_parent(parent),
+                )
+                .with_attribute(
+                    attribute::CONTEXT_RULE_VERSION,
+                    self.context_rule_version.clone(),
+                ),
+        );
         let report = self.hydrator.hydrate(hydration_request.clone()).await?;
+        drop(hydrate_span);
         let selected_tokens = report.selected_tokens();
         let hard_context_budget = selected_tokens >= budget.hard_input_limit_tokens;
         let soft_context_budget = selected_tokens >= budget.soft_input_limit_tokens;
@@ -881,6 +909,8 @@ impl LoopController {
                 SuspensionReason::BudgetExceeded,
             )
             .await?;
+            episode_span.set_end_attribute(attribute::SUSPENSION_CODE, "budget_exceeded");
+            episode_span.set_end_attribute(attribute::OUTCOME, "suspended");
             return Ok(OperationOutcome::Suspended);
         }
 
@@ -913,6 +943,17 @@ impl LoopController {
             )
             .await?;
 
+        let mut execute_span = Span::start(
+            &self.ports.telemetry,
+            episode_span
+                .context()
+                .cloned()
+                .map_or_else(
+                    || SpanStart::new(span_name::WORK_UNIT_EXECUTE),
+                    |parent| SpanStart::new(span_name::WORK_UNIT_EXECUTE).with_parent(parent),
+                )
+                .with_attribute(attribute::ATTEMPT_ID, attempt_id.to_string()),
+        );
         let request = WorkUnitRequest {
             protocol_version: loopward_api::PROTOCOL_VERSION.to_owned(),
             loop_id,
@@ -927,10 +968,14 @@ impl LoopController {
             output_contract: work_unit.output_contract.clone(),
             budget: work_unit.budget,
             deadline: None,
-            trace_context: TraceContext::default(),
+            trace_context: self.ports.telemetry.trace_context(execute_span.handle()),
         };
 
         let Ok(handle) = self.runner.start(request).await else {
+            execute_span.set_error(
+                "runner_failure",
+                "the runner rejected or could not start the attempt",
+            );
             let state = self
                 .apply(
                     loop_id,
@@ -949,8 +994,11 @@ impl LoopController {
                 SuspensionReason::Recovery,
             )
             .await?;
+            episode_span.set_end_attribute(attribute::ROTATION_REASON, "runner_failure");
+            episode_span.set_end_attribute(attribute::OUTCOME, "suspended");
             return Ok(OperationOutcome::Suspended);
         };
+        drop(execute_span);
 
         let external_ref = handle
             .external_execution_ref
@@ -965,7 +1013,19 @@ impl LoopController {
             )
             .await?;
 
+        let mut collect_span = Span::start(
+            &self.ports.telemetry,
+            episode_span.context().cloned().map_or_else(
+                || SpanStart::new(span_name::WORK_UNIT_COLLECT),
+                |parent| SpanStart::new(span_name::WORK_UNIT_COLLECT).with_parent(parent),
+            ),
+        );
         let Ok(collected) = self.runner.collect(&handle).await else {
+            collect_span.set_error(
+                "runner_failure",
+                "the runner could not produce a collectible result",
+            );
+            drop(collect_span);
             let state = self
                 .apply(
                     loop_id,
@@ -984,20 +1044,41 @@ impl LoopController {
                 SuspensionReason::Recovery,
             )
             .await?;
+            episode_span.set_end_attribute(attribute::ROTATION_REASON, "runner_failure");
+            episode_span.set_end_attribute(attribute::OUTCOME, "suspended");
             return Ok(OperationOutcome::Suspended);
         };
+        drop(collect_span);
 
-        self.finish_execution_attempt(
-            loop_id,
-            lease,
-            state,
-            episode_id,
-            hydration_request,
-            report.manifest.pinned_digest.clone(),
-            collected,
-            soft_context_budget,
-        )
-        .await
+        let result = self
+            .finish_execution_attempt(
+                loop_id,
+                lease,
+                state,
+                episode_id,
+                hydration_request,
+                report.manifest.pinned_digest.clone(),
+                collected,
+                soft_context_budget,
+            )
+            .await;
+        match &result {
+            Ok(OperationOutcome::EpisodeCompleted {
+                checkpoint_version, ..
+            }) => {
+                episode_span.set_end_attribute(
+                    attribute::CHECKPOINT_VERSION,
+                    checkpoint_version.to_string(),
+                );
+                episode_span.set_end_attribute(attribute::OUTCOME, "completed");
+            }
+            Ok(OperationOutcome::Suspended) => {
+                episode_span.set_end_attribute(attribute::OUTCOME, "suspended");
+            }
+            Ok(_) => {}
+            Err(err) => episode_span.set_error("controller_error", err.to_string()),
+        }
+        result
     }
 
     /// Drains a collected result to a committed Episode boundary: the
@@ -1094,9 +1175,11 @@ impl LoopController {
         &self,
         loop_id: LoopId,
         lease: &LoopLease,
-        state: AggregateState,
+        mut state: AggregateState,
         episode_id: EpisodeId,
     ) -> Result<OperationOutcome, ControllerError> {
+        let mut episode_span = self.open_episode_span(loop_id, episode_id, &mut state);
+
         let work_unit = state
             .work_unit
             .clone()
@@ -1126,7 +1209,22 @@ impl LoopController {
             context_rule_version: self.context_rule_version.clone(),
             candidates: self.candidates.candidates(&work_unit, &state.checkpoint),
         };
+        let hydrate_span = Span::start(
+            &self.ports.telemetry,
+            episode_span
+                .context()
+                .cloned()
+                .map_or_else(
+                    || SpanStart::new(span_name::CONTEXT_HYDRATE),
+                    |parent| SpanStart::new(span_name::CONTEXT_HYDRATE).with_parent(parent),
+                )
+                .with_attribute(
+                    attribute::CONTEXT_RULE_VERSION,
+                    self.context_rule_version.clone(),
+                ),
+        );
         let report = self.hydrator.hydrate(hydration_request).await?;
+        drop(hydrate_span);
         let state = self.mark_hydrated(loop_id, lease, &state, &report).await?;
 
         let session_id = self.ports.ids.new_session_id();
@@ -1149,6 +1247,7 @@ impl LoopController {
                 &work_unit,
                 &attempt,
                 &result_ref,
+                episode_span.context(),
             )
             .await?;
 
@@ -1172,6 +1271,7 @@ impl LoopController {
                 )
                 .await?;
             let _ = committed;
+            episode_span.set_end_attribute(attribute::OUTCOME, "suspended");
             return Ok(OperationOutcome::Suspended);
         }
 
@@ -1184,6 +1284,11 @@ impl LoopController {
                 RotationReason::VerificationBoundary,
             )
             .await?;
+        episode_span.set_end_attribute(
+            attribute::CHECKPOINT_VERSION,
+            committed.checkpoint.version.to_string(),
+        );
+        episode_span.set_end_attribute(attribute::OUTCOME, "completed");
         Ok(OperationOutcome::EpisodeCompleted {
             episode_id,
             checkpoint_version: committed.checkpoint.version,
@@ -1215,6 +1320,58 @@ impl LoopController {
             reserved_tool_tokens: self.default_budget.reserved_tool_tokens,
             safety_margin_tokens: self.default_budget.safety_margin_tokens,
         }
+    }
+
+    /// Opens this Episode's root `loopward.episode` span
+    /// (`docs/08-tracing-and-observability.md` §4, §5): one top-level trace
+    /// per Episode, linked via `continuation_of` to the prior Episode's
+    /// trace when this controller has seen one for `loop_id` before
+    /// (best-effort, in-process only — see [`Self::trace_continuity`]'s doc
+    /// comment).
+    ///
+    /// Also durably records this Episode's trace id
+    /// (`docs/02-core-domain-model.md`'s `Episode::trace_id`) onto `state`
+    /// so it survives to whatever Checkpoint this Episode eventually
+    /// commits, giving an operator a durable correlation even across a
+    /// process restart that loses the in-process continuity map.
+    fn open_episode_span(
+        &self,
+        loop_id: LoopId,
+        episode_id: EpisodeId,
+        state: &mut AggregateState,
+    ) -> Span {
+        let continuation = self
+            .trace_continuity
+            .lock()
+            .expect("trace continuity lock poisoned")
+            .get(&loop_id)
+            .cloned();
+
+        let mut start = SpanStart::new(span_name::EPISODE)
+            .with_attribute(attribute::LOOP_ID, loop_id.to_string())
+            .with_attribute(attribute::EPISODE_ID, episode_id.to_string())
+            .with_attribute(
+                attribute::CHECKPOINT_VERSION,
+                state.checkpoint.version.to_string(),
+            );
+        if let Some(continuation) = &continuation {
+            start = start.with_link(SpanLink::new(
+                SpanLinkKind::ContinuationOf,
+                continuation.trace_id.clone(),
+            ));
+        }
+        let span = Span::start(&self.ports.telemetry, start);
+
+        if let Some(context) = span.context() {
+            if let Some(episode) = state.episode.as_mut() {
+                episode.trace_id = Some(context.trace_id.clone());
+            }
+            self.trace_continuity
+                .lock()
+                .expect("trace continuity lock poisoned")
+                .insert(loop_id, context.clone());
+        }
+        span
     }
 
     /// `pub(crate)`: shared with [`crate::recovery::RecoveryManager`], which
@@ -1249,6 +1406,14 @@ impl LoopController {
     /// (`docs/06-verification-and-recovery.md` §12) — verification is a pure
     /// Loopward computation over durable inputs, so redoing it is always
     /// safe, unlike blindly repeating a runner's external effect.
+    ///
+    /// `parent` is the enclosing Episode span's context, when one is active
+    /// ([`Self::run_verification_episode`] always has one;
+    /// [`crate::recovery::RecoveryManager`]'s recovery-driven re-evaluation
+    /// currently passes `None`, so a recovered verification judgement is
+    /// traced as its own standalone span rather than nested under a
+    /// recovery span — an accepted, best-effort simplification, not a
+    /// correctness concern per `docs/08` §13).
     pub(crate) async fn evaluate_verification(
         &self,
         loop_id: LoopId,
@@ -1256,7 +1421,23 @@ impl LoopController {
         work_unit: &WorkUnit,
         attempt: &loopward_core::WorkUnitAttempt,
         result_ref: &ResourceRef,
+        parent: Option<&SpanContext>,
     ) -> Result<VerificationOutcome, ControllerError> {
+        let mut span = Span::start(
+            &self.ports.telemetry,
+            parent
+                .cloned()
+                .map_or_else(
+                    || SpanStart::new(span_name::VERIFICATION_EVALUATE),
+                    |parent| SpanStart::new(span_name::VERIFICATION_EVALUATE).with_parent(parent),
+                )
+                .with_attribute(attribute::WORK_UNIT_ID, work_unit.id.to_string())
+                .with_attribute(attribute::ATTEMPT_ID, attempt.id.to_string())
+                .with_attribute(
+                    attribute::CHECKPOINT_VERSION,
+                    checkpoint_version.to_string(),
+                ),
+        );
         let template = self
             .plans
             .resolve(&work_unit.verification_plan)
@@ -1308,6 +1489,7 @@ impl LoopController {
                 observed_at: self.ports.clock.now(),
             })
             .await?;
+        span.set_end_attribute(attribute::VERIFICATION_OUTCOME, run.outcome.label());
         Ok(run.outcome)
     }
 
@@ -1398,6 +1580,15 @@ impl LoopController {
         state: &AggregateState,
         checkpoint: Checkpoint,
     ) -> Result<AggregateState, ControllerError> {
+        let mut span = Span::start(
+            &self.ports.telemetry,
+            SpanStart::new(span_name::CHECKPOINT_COMMIT)
+                .with_attribute(attribute::LOOP_ID, loop_id.to_string())
+                .with_attribute(
+                    attribute::CHECKPOINT_VERSION,
+                    checkpoint.version.to_string(),
+                ),
+        );
         let command = LifecycleCommand::CommitCheckpoint {
             checkpoint: checkpoint.clone(),
         };
@@ -1409,7 +1600,8 @@ impl LoopController {
             next = evolve(next, event)?;
         }
         validate_invariants(&next)?;
-        self.ports
+        let result = self
+            .ports
             .store
             .commit_checkpoint(CheckpointCommitRequest {
                 loop_id,
@@ -1420,7 +1612,11 @@ impl LoopController {
                 events,
                 state: next.clone(),
             })
-            .await?;
+            .await;
+        if let Err(err) = &result {
+            span.set_error("store_error", err.to_string());
+        }
+        result?;
         Ok(next)
     }
 
