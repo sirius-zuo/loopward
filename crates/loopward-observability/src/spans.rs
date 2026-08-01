@@ -172,11 +172,23 @@ impl SpanLink {
 /// (a runner protocol error, a store failure) should ever produce
 /// [`SpanStatus::Error`]; a business rejection or suspension is a
 /// successful span carrying `loopward.outcome=...`.
+///
+/// [`SpanStatus::Unset`] — not [`SpanStatus::Ok`] — is the default: a
+/// [`Span`] that ends via [`Drop`] without an explicit outcome (any `?` or
+/// `let ... else { return ... }` inside a wrapped call that this crate's
+/// "wrap, don't restructure" instrumentation style deliberately never
+/// intercepts) must never be recorded as an affirmative success.
+/// `OpenTelemetry`'s own status semantics agree: `Status::Ok` is an
+/// application's explicit assertion that an operation succeeded, not a
+/// neutral "nothing went wrong" — `Status::Unset` is that neutral state, and
+/// is what most spans that never fail are expected to carry.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum SpanStatus {
+    /// No outcome was explicitly recorded for this span.
+    #[default]
+    Unset,
     /// The operation this span represents completed, whatever its business
     /// outcome.
-    #[default]
     Ok,
     /// A transport- or protocol-level failure occurred.
     Error {
@@ -247,10 +259,18 @@ pub struct SpanEnd {
 }
 
 impl SpanEnd {
-    /// A successful conclusion with no additional attributes.
+    /// An explicit successful conclusion with no additional attributes.
+    ///
+    /// Distinct from [`Self::default`] (used by [`Span`]'s silent `Drop`
+    /// path), which is [`SpanStatus::Unset`], not `Ok` — see
+    /// [`SpanStatus`]'s doc comment for why an unexamined span must never
+    /// default to an affirmative success.
     #[must_use]
     pub fn ok() -> Self {
-        Self::default()
+        Self {
+            attributes: Vec::new(),
+            status: SpanStatus::Ok,
+        }
     }
 
     /// A transport/protocol-error conclusion.
@@ -290,9 +310,9 @@ impl SpanEnd {
 /// start a [`Span`] before a sequence of calls that may return early through
 /// `?` or a `let ... else`, and the span still ends exactly once, with
 /// whatever outcome was last recorded on it (defaulting to
-/// [`SpanStatus::Ok`] with no extra attributes) — the same "wrap, don't
-/// rewrite" shape `docs/08`'s testability section expects instrumentation
-/// to have.
+/// [`SpanStatus::Unset`] with no extra attributes — never an unearned
+/// `Ok`) — the same "wrap, don't rewrite" shape `docs/08`'s testability
+/// section expects instrumentation to have.
 ///
 /// Ending is always best-effort and synchronous
 /// (`docs/08` §13): [`Drop::drop`] cannot run async code, so
@@ -336,7 +356,8 @@ impl Span {
 
     /// Marks this span as a transport/protocol-level error
     /// (`docs/08` §10) — never for a business rejection or suspension,
-    /// which stays [`SpanStatus::Ok`] with a `loopward.outcome` attribute.
+    /// which stays [`SpanStatus::Unset`] (or an explicitly recorded
+    /// [`SpanStatus::Ok`]) with a `loopward.outcome` attribute instead.
     pub fn set_error(&mut self, code: &'static str, message: impl Into<String>) {
         self.end.status = SpanStatus::Error {
             code,
@@ -405,7 +426,15 @@ mod tests {
                 assert_eq!(code, "runner_failure");
                 assert_eq!(message.as_deref(), Some("sanitized detail"));
             }
-            super::SpanStatus::Ok => panic!("expected an error status"),
+            super::SpanStatus::Ok | super::SpanStatus::Unset => {
+                panic!("expected an error status")
+            }
         }
+    }
+
+    #[test]
+    fn span_end_default_is_unset_not_ok() {
+        assert_eq!(super::SpanEnd::default().status, super::SpanStatus::Unset);
+        assert_eq!(super::SpanEnd::ok().status, super::SpanStatus::Ok);
     }
 }

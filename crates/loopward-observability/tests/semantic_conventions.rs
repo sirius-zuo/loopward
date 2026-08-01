@@ -140,11 +140,17 @@ fn no_built_in_attribute_key_names_a_forbidden_payload_concept() {
     }
 }
 
-/// A realistic Episode span, recorded end to end, must carry only bounded
-/// identifiers and outcomes — never a full prompt, Boot Package payload, or
-/// raw resource content — even though the recorder itself performs no
-/// redaction (`docs/08` §6: "High-cardinality identifiers are appropriate
-/// for traces"; §12/§15: full payloads are not).
+/// Exercises this crate's own [`RecordingSink`] plumbing (start/end,
+/// attribute accumulation) with attribute *values* this test chose itself.
+/// This proves the recorder correctly reports back whatever it was given —
+/// it does **not** prove real runtime instrumentation never puts sensitive
+/// content into a value. That end-to-end guarantee (`docs/08` §12/§15: "no
+/// full prompt or resource payload by default") is proven against a real,
+/// running `LoopController` and a real `OpenTelemetry` exporter in
+/// `loopward-observability-otel`'s
+/// `no_span_or_event_attribute_leaks_marked_sensitive_content` test, which
+/// this crate cannot depend on (that crate depends on this one, not the
+/// reverse).
 #[test]
 fn a_recorded_episode_span_carries_no_forbidden_payload_content() {
     let sink = RecordingSink::new();
@@ -178,6 +184,10 @@ fn a_recorded_episode_span_carries_no_forbidden_payload_content() {
     }
 }
 
+/// As above: proves the [`RecordingSink`]'s event plumbing round-trips
+/// attribute values correctly, not that real instrumentation never emits a
+/// sensitive one — see `no_span_or_event_attribute_leaks_marked_sensitive_content`
+/// in `loopward-observability-otel` for the real end-to-end proof.
 #[test]
 fn span_events_stay_bounded_and_never_carry_raw_prompt_text() {
     let sink = RecordingSink::new();

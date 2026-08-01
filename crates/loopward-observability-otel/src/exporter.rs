@@ -212,6 +212,13 @@ impl TelemetrySink for OtelTelemetrySink {
             span.set_attribute(KeyValue::new(key, value));
         }
         match end.status {
+            // `Unset` is the OpenTelemetry SDK's own default for a freshly
+            // built span, so there is nothing to set here: explicitly
+            // calling `set_status(Status::Unset)` would be a no-op, and
+            // real OpenTelemetry `Status` has no way to move a span back to
+            // `Unset` from a `set_status` call in the first place (its own
+            // semantics only allow `Unset -> Error` or `Unset -> Ok`).
+            SpanStatus::Unset => {}
             SpanStatus::Ok => span.set_status(Status::Ok),
             SpanStatus::Error { code, message } => {
                 span.set_attribute(KeyValue::new(attribute::FAILURE_CODE, code));

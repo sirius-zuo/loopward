@@ -53,7 +53,8 @@ use loopward_runtime::verification::{
     VerificationGateKind, VerificationGateSpec, VerificationPlanId,
 };
 use loopward_runtime::{
-    ContextCandidateProvider, LoopController, VerificationPlanResolver, VerificationPlanTemplate,
+    ContextCandidateProvider, LoopController, RecoveryManager, RecoveryOutcome,
+    VerificationPlanResolver, VerificationPlanTemplate,
 };
 use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
 use uuid::Uuid;
@@ -129,6 +130,25 @@ impl InMemoryResourceBroker {
             finalized: Mutex::new(HashMap::new()),
             next: AtomicU64::new(1),
         }
+    }
+
+    /// Test-only seam: removes a finalized resource, simulating a crash
+    /// that leaves a reference the next step cannot resolve. Returns the
+    /// removed bytes so the caller can restore them later.
+    fn poison(&self, uri: &str) -> Vec<u8> {
+        self.finalized
+            .lock()
+            .expect("finalized resource lock poisoned")
+            .remove(uri)
+            .expect("resource existed before poisoning")
+    }
+
+    /// Undoes [`Self::poison`].
+    fn restore(&self, uri: String, bytes: Vec<u8>) {
+        self.finalized
+            .lock()
+            .expect("finalized resource lock poisoned")
+            .insert(uri, bytes);
     }
 }
 
@@ -381,9 +401,15 @@ impl LoopStore for InMemoryLoopStore {
 
 /// A [`WorkUnitRunner`] that always succeeds, recording every request's
 /// propagated `trace_context` so the test can assert it was populated.
+///
+/// `result_marker`, when set, is embedded in the collected result's one
+/// output (`docs/08-tracing-and-observability.md` §12/§15's "no full …
+/// resource payload by default") standing in for real resource content a
+/// naive future change might accidentally copy into a span attribute.
 struct FakeRunner {
     start_calls: AtomicUsize,
     last_traceparent: Mutex<Option<String>>,
+    result_marker: Option<String>,
 }
 
 impl FakeRunner {
@@ -391,6 +417,14 @@ impl FakeRunner {
         Self {
             start_calls: AtomicUsize::new(0),
             last_traceparent: Mutex::new(None),
+            result_marker: None,
+        }
+    }
+
+    fn with_result_marker(marker: impl Into<String>) -> Self {
+        Self {
+            result_marker: Some(marker.into()),
+            ..Self::new()
         }
     }
 
@@ -477,11 +511,22 @@ impl WorkUnitRunner for FakeRunner {
     }
 
     async fn collect(&self, handle: &RunHandle) -> Result<WorkUnitResult, RunnerError> {
+        let outputs = match &self.result_marker {
+            Some(marker) => vec![ResourceRef {
+                uri: "resource://produced-output".to_owned(),
+                media_type: Some("text/plain".to_owned()),
+                digest: None,
+                version: None,
+                size: None,
+                summary: Some(marker.clone()),
+            }],
+            None => Vec::new(),
+        };
         Ok(WorkUnitResult {
             protocol_version: loopward_api::PROTOCOL_VERSION.to_owned(),
             attempt_id: handle.attempt_id,
             outcome: WorkUnitOutcome::Produced,
-            outputs: Vec::new(),
+            outputs,
             state_proposals: Vec::new(),
             observation_proposals: Vec::new(),
             decision_proposals: Vec::new(),
@@ -752,5 +797,246 @@ async fn two_episodes_produce_linked_traces_with_propagated_runner_context() {
         execute_spans[0].span_context.trace_id(),
         episode_one.span_context.trace_id(),
         "the runner boundary span must nest under the Execution Episode's trace"
+    );
+}
+
+/// `docs/08` §12/§15: "traces contain no full prompt or resource payload by
+/// default". Seeds a recognizable marker into both the Work Unit's
+/// natural-language objective (standing in for prompt content) and the
+/// collected result's one output (standing in for produced resource
+/// content), runs a real two-Episode sequence end to end, and asserts the
+/// marker never appears anywhere in the actually exported spans — proving
+/// the redaction guarantee against real emitted telemetry, not just the
+/// crate's own constant names or attribute values the test itself chose.
+#[tokio::test]
+async fn no_span_or_event_attribute_leaks_marked_sensitive_content() {
+    const MARKER: &str = "SENSITIVE-PAYLOAD-MARKER-88f3a2c1";
+
+    let exporter = InMemorySpanExporter::default();
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let telemetry = Arc::new(OtelTelemetrySink::new(&provider));
+
+    let ids = Arc::new(SequentialIdGenerator::new());
+    let loop_id = ids.new_loop_id();
+    let mut work_unit = test_work_unit(WorkUnitId::new());
+    work_unit.objective = format!("do the test thing, referencing {MARKER}");
+    let store = Arc::new(InMemoryLoopStore::new());
+    store.seed(loop_id, genesis_state(loop_id, work_unit));
+
+    let ports = RuntimePorts {
+        store,
+        resources: Arc::new(InMemoryResourceBroker::new()),
+        clock: Arc::new(FixedClock(Timestamp::UNIX_EPOCH)),
+        ids,
+        telemetry: telemetry as Arc<dyn loopward_observability::TelemetrySink>,
+    };
+
+    let runner = Arc::new(FakeRunner::with_result_marker(MARKER));
+    let controller = LoopController::new(
+        ports.clone(),
+        Arc::clone(&runner) as Arc<dyn WorkUnitRunner>,
+        Arc::new(AlwaysAcceptPlan),
+    )
+    .with_default_budget(generous_budget())
+    .with_candidate_provider(Arc::new(NoCandidates));
+
+    controller
+        .advance(loop_id)
+        .await
+        .expect("execution episode advances");
+    controller
+        .advance(loop_id)
+        .await
+        .expect("verification episode advances");
+
+    provider.force_flush().expect("flush succeeds");
+    let spans = exporter
+        .get_finished_spans()
+        .expect("exporter is not shut down");
+    assert!(
+        !spans.is_empty(),
+        "the run must have produced spans to check"
+    );
+
+    for span in &spans {
+        for kv in &span.attributes {
+            assert!(
+                !kv.value.as_str().contains(MARKER),
+                "span `{}` attribute `{}` leaked marked sensitive content",
+                span.name,
+                kv.key.as_str()
+            );
+        }
+        for event in span.events.iter() {
+            assert!(
+                !event.name.contains(MARKER),
+                "span `{}` event name leaked marked sensitive content",
+                span.name
+            );
+            for kv in &event.attributes {
+                assert!(
+                    !kv.value.as_str().contains(MARKER),
+                    "span `{}` event `{}` attribute `{}` leaked marked sensitive content",
+                    span.name,
+                    event.name,
+                    kv.key.as_str()
+                );
+            }
+        }
+        for link in span.links.iter() {
+            for kv in &link.attributes {
+                assert!(
+                    !kv.value.as_str().contains(MARKER),
+                    "span `{}` link attribute `{}` leaked marked sensitive content",
+                    span.name,
+                    kv.key.as_str()
+                );
+            }
+        }
+    }
+}
+
+/// `docs/08` §4, §7, §13: recovery's `recovery_of` link is sourced from
+/// `LoopController`'s in-process `trace_continuity` map, not any durable
+/// field — so it is only available when the same process instance that ran
+/// the interrupted Episode also performs the recovery. This test proves the
+/// link actually appears in that scenario (not just that the map exists):
+/// it drives a real crash — a resource that goes missing mid-verification,
+/// leaving the Episode's Session started but `verification.completed` never
+/// recorded, exactly `docs/06-verification-and-recovery.md`'s failure point
+/// 5 — recovers it in the same process, and asserts the recovery span's
+/// link names the interrupted Episode's actual (real, exported) trace ID.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn recovery_of_link_references_the_interrupted_episodes_real_trace_in_the_same_process() {
+    let exporter = InMemorySpanExporter::default();
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let telemetry = Arc::new(OtelTelemetrySink::new(&provider));
+
+    let ids = Arc::new(SequentialIdGenerator::new());
+    let loop_id = ids.new_loop_id();
+    let work_unit = test_work_unit(WorkUnitId::new());
+    let store = Arc::new(InMemoryLoopStore::new());
+    store.seed(loop_id, genesis_state(loop_id, work_unit));
+    let broker = Arc::new(InMemoryResourceBroker::new());
+
+    let ports = RuntimePorts {
+        store,
+        resources: Arc::clone(&broker) as Arc<dyn ResourceBroker>,
+        clock: Arc::new(FixedClock(Timestamp::UNIX_EPOCH)),
+        ids,
+        telemetry: telemetry as Arc<dyn loopward_observability::TelemetrySink>,
+    };
+
+    let runner = Arc::new(FakeRunner::new());
+    let controller = LoopController::new(
+        ports.clone(),
+        Arc::clone(&runner) as Arc<dyn WorkUnitRunner>,
+        Arc::new(AlwaysAcceptPlan),
+    )
+    .with_default_budget(generous_budget())
+    .with_candidate_provider(Arc::new(NoCandidates));
+
+    // Episode 1 (Execution) completes normally.
+    controller
+        .advance(loop_id)
+        .await
+        .expect("execution episode advances");
+
+    // Simulate a crash during Episode 2 (Verification): poison the
+    // Attempt's result resource so `evaluate_verification`'s resolve fails
+    // partway through, after the Session already started (and durably
+    // committed) but before `verification.completed` is ever recorded.
+    let after_execution = ports.store.load(loop_id).await.expect("load succeeds");
+    let result_ref = after_execution
+        .state
+        .attempt
+        .as_ref()
+        .and_then(|attempt| attempt.result_ref.clone())
+        .expect("the execution episode recorded a result reference");
+    let poisoned_bytes = broker.poison(&result_ref.uri);
+
+    let crash = controller.advance(loop_id).await;
+    assert!(
+        crash.is_err(),
+        "the poisoned resource must fail the verification episode outright"
+    );
+
+    let after_crash = ports.store.load(loop_id).await.expect("load succeeds");
+    assert!(
+        after_crash.state.active_episode().is_some(),
+        "the crash must leave an active (non-terminal) Episode behind"
+    );
+
+    // Restore the resource — the recovery attempt below must be able to
+    // resolve it — then recover in the *same process*, so the same
+    // `trace_continuity` map instance is used for both the crash and the
+    // recovery.
+    broker.restore(result_ref.uri.clone(), poisoned_bytes);
+
+    let recovery = RecoveryManager::new(controller.clone());
+    let outcome = recovery.recover(loop_id).await.expect("recovery succeeds");
+    assert!(
+        matches!(outcome, RecoveryOutcome::EpisodeRecovered { .. }),
+        "expected the interrupted verification Episode to be recovered, got {outcome:?}"
+    );
+
+    provider.force_flush().expect("flush succeeds");
+    let spans = exporter
+        .get_finished_spans()
+        .expect("exporter is not shut down");
+
+    let episode_spans: Vec<_> = spans
+        .iter()
+        .filter(|span| span.name == "loopward.episode")
+        .collect();
+    assert_eq!(
+        episode_spans.len(),
+        2,
+        "expected one Episode span for the completed execution episode and \
+         one for the interrupted (crashed) verification episode"
+    );
+    // The interrupted Episode's span records no `loopward.outcome` (its
+    // `run_verification_episode` call returned `Err` before reaching any of
+    // the `set_end_attribute(attribute::OUTCOME, ..)` call sites) — that is
+    // exactly what distinguishes it from the completed execution Episode's
+    // span here.
+    let interrupted_episode = episode_spans
+        .iter()
+        .find(|span| {
+            !span
+                .attributes
+                .iter()
+                .any(|kv| kv.key.as_str() == "loopward.outcome")
+        })
+        .expect("one Episode span must be the interrupted, outcome-less one");
+
+    let recovery_spans: Vec<_> = spans
+        .iter()
+        .filter(|span| span.name == "loopward.recovery.reconcile")
+        .collect();
+    assert_eq!(recovery_spans.len(), 1);
+    let recovery_span = recovery_spans[0];
+
+    assert_eq!(
+        recovery_span.links.iter().count(),
+        1,
+        "the recovery span must carry exactly one link"
+    );
+    let link = recovery_span.links.iter().next().expect("one link present");
+    let link_kind = link
+        .attributes
+        .iter()
+        .find(|kv| kv.key.as_str() == "loopward.link.kind")
+        .map(|kv| kv.value.as_str().to_string());
+    assert_eq!(link_kind.as_deref(), Some("recovery_of"));
+    assert_eq!(
+        link.span_context.trace_id(),
+        interrupted_episode.span_context.trace_id(),
+        "the recovery_of link must reference the interrupted Episode's actual trace ID"
     );
 }

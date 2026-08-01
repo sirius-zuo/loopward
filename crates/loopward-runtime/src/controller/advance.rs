@@ -89,7 +89,9 @@ use loopward_core::{
     LoopEvent, LoopStatus, RotationReason, VerificationOutcome, decide, evolve,
     validate_invariants, work_unit_status_is_terminal,
 };
+use loopward_observability::TelemetryEvent;
 use loopward_observability::attribute;
+use loopward_observability::event_name;
 use loopward_observability::spans::{
     Span, SpanContext, SpanLink, SpanLinkKind, SpanStart, span_name,
 };
@@ -520,7 +522,8 @@ impl LoopController {
         });
         if let Some(episode_id) = newly_terminal_episode_id {
             let checkpoint = self.build_checkpoint(&suspended, episode_id);
-            self.commit(loop_id, &lease, &suspended, checkpoint).await?;
+            self.commit(loop_id, &lease, &suspended, checkpoint, None)
+                .await?;
         }
         Ok(())
     }
@@ -841,10 +844,10 @@ impl LoopController {
         &self,
         loop_id: LoopId,
         lease: &LoopLease,
-        mut state: AggregateState,
+        state: AggregateState,
         episode_id: EpisodeId,
     ) -> Result<OperationOutcome, ControllerError> {
-        let mut episode_span = self.open_episode_span(loop_id, episode_id, &mut state);
+        let mut episode_span = self.open_episode_span(loop_id, episode_id, &state);
 
         let work_unit = state
             .work_unit
@@ -1175,10 +1178,10 @@ impl LoopController {
         &self,
         loop_id: LoopId,
         lease: &LoopLease,
-        mut state: AggregateState,
+        state: AggregateState,
         episode_id: EpisodeId,
     ) -> Result<OperationOutcome, ControllerError> {
-        let mut episode_span = self.open_episode_span(loop_id, episode_id, &mut state);
+        let mut episode_span = self.open_episode_span(loop_id, episode_id, &state);
 
         let work_unit = state
             .work_unit
@@ -1329,23 +1332,24 @@ impl LoopController {
     /// (best-effort, in-process only — see [`Self::trace_continuity`]'s doc
     /// comment).
     ///
-    /// Also durably records this Episode's trace id
-    /// (`docs/02-core-domain-model.md`'s `Episode::trace_id`) onto `state`
-    /// so it survives to whatever Checkpoint this Episode eventually
-    /// commits, giving an operator a durable correlation even across a
-    /// process restart that loses the in-process continuity map.
+    /// Deliberately does **not** write anything onto `state`/`AggregateState`:
+    /// an earlier version of this method stamped the new trace id onto
+    /// `state.episode.trace_id`, but that field then flowed into whatever
+    /// Checkpoint the Episode eventually committed, making the durably
+    /// persisted Checkpoint bytes vary by telemetry configuration — exactly
+    /// what `docs/08` §13/§15 rules out ("telemetry loss cannot corrupt …
+    /// durable recovery"), and unreproducible by replaying the event
+    /// journal through `evolve` (no `LifecycleCommand`/`LoopEvent` ever sets
+    /// it). Trace continuity lives *only* in [`Self::trace_continuity`],
+    /// which is exactly the best-effort, in-process-only, telemetry-disabled-
+    /// safe place for it.
     fn open_episode_span(
         &self,
         loop_id: LoopId,
         episode_id: EpisodeId,
-        state: &mut AggregateState,
+        state: &AggregateState,
     ) -> Span {
-        let continuation = self
-            .trace_continuity
-            .lock()
-            .expect("trace continuity lock poisoned")
-            .get(&loop_id)
-            .cloned();
+        let continuation = self.trace_continuity_context(loop_id);
 
         let mut start = SpanStart::new(span_name::EPISODE)
             .with_attribute(attribute::LOOP_ID, loop_id.to_string())
@@ -1363,15 +1367,28 @@ impl LoopController {
         let span = Span::start(&self.ports.telemetry, start);
 
         if let Some(context) = span.context() {
-            if let Some(episode) = state.episode.as_mut() {
-                episode.trace_id = Some(context.trace_id.clone());
-            }
             self.trace_continuity
                 .lock()
                 .expect("trace continuity lock poisoned")
                 .insert(loop_id, context.clone());
         }
         span
+    }
+
+    /// The most recent Episode trace this controller has seen for
+    /// `loop_id`, if any (`docs/08` §4, §7).
+    ///
+    /// Best-effort and in-process only — see [`Self::trace_continuity`]'s
+    /// doc comment. `pub(crate)`: [`crate::recovery::RecoveryManager`] reads
+    /// this to link its own `loopward.recovery.reconcile` span back to the
+    /// Episode it is recovering, when the same process instance ran both.
+    #[must_use]
+    pub(crate) fn trace_continuity_context(&self, loop_id: LoopId) -> Option<SpanContext> {
+        self.trace_continuity
+            .lock()
+            .expect("trace continuity lock poisoned")
+            .get(&loop_id)
+            .cloned()
     }
 
     /// `pub(crate)`: shared with [`crate::recovery::RecoveryManager`], which
@@ -1571,6 +1588,14 @@ impl LoopController {
     /// Decides and evolves a [`LifecycleCommand::CommitCheckpoint`] against
     /// `state`, then atomically commits it.
     ///
+    /// `rotation_reason`, when present, is recorded as `loopward.rotation.reason`
+    /// on the commit span and as a `rotation.requested` diagnostic event
+    /// (`docs/08-tracing-and-observability.md` §6, §9) — this is the one
+    /// place every routine rotation (`WorkUnitBoundary`, `VerificationBoundary`,
+    /// and everything [`Self::rotate_and_commit`] is asked to record) becomes
+    /// traceable, not just the runner-failure suspension paths that already
+    /// set it directly on their enclosing Episode span.
+    ///
     /// `pub(crate)`: shared with [`crate::recovery::RecoveryManager`] for the
     /// same reason as [`Self::apply`].
     pub(crate) async fn commit(
@@ -1579,6 +1604,7 @@ impl LoopController {
         lease: &LoopLease,
         state: &AggregateState,
         checkpoint: Checkpoint,
+        rotation_reason: Option<RotationReason>,
     ) -> Result<AggregateState, ControllerError> {
         let mut span = Span::start(
             &self.ports.telemetry,
@@ -1589,6 +1615,14 @@ impl LoopController {
                     checkpoint.version.to_string(),
                 ),
         );
+        if let Some(reason) = rotation_reason {
+            let label = format!("{reason:?}");
+            span.set_end_attribute(attribute::ROTATION_REASON, label.clone());
+            span.event(
+                TelemetryEvent::new(event_name::ROTATION_REQUESTED)
+                    .with_attribute(attribute::ROTATION_REASON, label),
+            );
+        }
         let command = LifecycleCommand::CommitCheckpoint {
             checkpoint: checkpoint.clone(),
         };
@@ -1668,7 +1702,8 @@ impl LoopController {
             )
             .await?;
         let checkpoint = self.build_checkpoint(&state, episode_id);
-        self.commit(loop_id, lease, &state, checkpoint).await
+        self.commit(loop_id, lease, &state, checkpoint, Some(reason))
+            .await
     }
 
     /// Ensures the Loop is suspended (issuing [`LifecycleCommand::Suspend`]
@@ -1710,6 +1745,6 @@ impl LoopController {
             state
         };
         let checkpoint = self.build_checkpoint(&state, episode_id);
-        self.commit(loop_id, lease, &state, checkpoint).await
+        self.commit(loop_id, lease, &state, checkpoint, None).await
     }
 }

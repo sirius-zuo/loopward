@@ -801,9 +801,14 @@ impl RecoveryManager {
             });
         }
         let checkpoint = self.controller.build_checkpoint(&state, episode_id);
+        // The rotation reason was already durably recorded pre-crash (the
+        // Episode is `Draining`, meaning `RequestRotation` already
+        // committed); it is not re-derived here, so this commit's span
+        // carries no `loopward.rotation.reason` — an accepted, narrow gap
+        // distinct from the routine paths this fix round addresses.
         let committed = self
             .controller
-            .commit(loop_id, lease, &state, checkpoint)
+            .commit(loop_id, lease, &state, checkpoint, None)
             .await?;
         Ok(EpisodeRecoveryOutcome::Completed {
             episode_id,

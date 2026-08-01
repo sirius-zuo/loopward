@@ -202,12 +202,18 @@ impl RecoveryManager {
 
         let mut start = SpanStart::new(span_name::RECOVERY_RECONCILE)
             .with_attribute(attribute::LOOP_ID, loop_id.to_string());
-        if let Some(trace_id) = state
-            .episode
-            .as_ref()
-            .and_then(|episode| episode.trace_id.clone())
-        {
-            start = start.with_link(SpanLink::new(SpanLinkKind::RecoveryOf, trace_id));
+        // Best-effort, in-process only (`docs/08` §4, §7, §13): this reads
+        // the same `trace_continuity` map `LoopController::open_episode_span`
+        // populates, not any durable field — the link is only present when
+        // the same process instance that ran the interrupted Episode is
+        // also the one performing recovery. Losing it across an actual
+        // process restart is an accepted degradation, not a gap this method
+        // tries to close: tracing is not the recovery path.
+        if let Some(continuation) = self.controller.trace_continuity_context(loop_id) {
+            start = start.with_link(SpanLink::new(
+                SpanLinkKind::RecoveryOf,
+                continuation.trace_id,
+            ));
         }
         let mut span = Span::start(&self.controller.ports().telemetry, start);
 
