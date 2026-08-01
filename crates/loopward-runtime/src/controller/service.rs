@@ -35,7 +35,7 @@ use loopward_core::{AggregateState, LoopStatus as CoreLoopStatus, work_unit_stat
 
 use crate::controller::{ControllerError, LoopController};
 use crate::ports::{RecordedEvent, StoreError};
-use crate::recovery::RecoveryManager;
+use crate::recovery::{RecoveryManager, RecoveryOutcome};
 
 /// The public `LoopService` adapter over [`LoopController`].
 pub struct RuntimeLoopService {
@@ -385,6 +385,17 @@ impl loopward_api::loop_service::LoopService for RuntimeLoopService {
     /// before assuming the external effect is safe to retire) and returns
     /// the Work Unit to `Pending`, so the Loop this call hands back is
     /// actually ready to `advance`, not merely `Active` in name.
+    ///
+    /// Recovery can also legitimately conclude the opposite —
+    /// [`RecoveryOutcome::StillSuspended`], when the runner cannot confirm
+    /// the old external effect is actually over. Reporting bare success in
+    /// that case would be a lie: the Loop would sit `Active` with a
+    /// non-terminal Attempt, and every future `advance` would fail the
+    /// reducer's `attempt.reconciled_before_next_generation` invariant
+    /// permanently. This re-suspends the Loop before returning and reports
+    /// the resume as refused (`LoopwardErrorCode::RecoveryRequired`) rather
+    /// than a bare `Ok`, so a caller cannot mistake "resumed" for "actually
+    /// advanceable".
     async fn resume(&self, command: ResumeLoopCommand) -> Result<OperationHandle, LoopwardError> {
         if let Some(existing) = self.previously_accepted(&command.metadata.idempotency_key) {
             return Ok(existing);
@@ -397,9 +408,25 @@ impl loopward_api::loop_service::LoopService for RuntimeLoopService {
             .resume(command.loop_id)
             .await
             .map_err(controller_error)?;
-        Box::pin(self.recovery.recover(command.loop_id))
+        let recovery_outcome = Box::pin(self.recovery.recover(command.loop_id))
             .await
             .map_err(controller_error)?;
+
+        if let RecoveryOutcome::StillSuspended { reason } = recovery_outcome {
+            self.controller
+                .suspend(command.loop_id, reason)
+                .await
+                .map_err(controller_error)?;
+            return Err(LoopwardError {
+                code: LoopwardErrorCode::RecoveryRequired,
+                message: format!(
+                    "loop {} could not be resumed: a reconciled attempt's external effect may still be live",
+                    command.loop_id
+                ),
+                retryable: true,
+                trace_ref: None,
+            });
+        }
 
         let handle = OperationHandle {
             operation_id: self.controller.ports().ids.new_operation_id(),

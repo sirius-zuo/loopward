@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use loopward_api::context::{
     ContextBudget as ApiContextBudget, ContextCapabilities, ContextControlLevel,
 };
+use loopward_api::error::LoopwardErrorCode;
 use loopward_api::event::EventCursor;
 use loopward_api::ids::{
     AttemptId, CheckpointId, EpisodeId, EventId, LoopId, OperationId, SessionId, Timestamp,
@@ -488,6 +489,21 @@ impl ConfigurableRunner {
         self
     }
 
+    fn failing_to_start(mut self) -> Self {
+        self.fail_start = true;
+        self
+    }
+
+    /// Changes what a later `reconcile` call reports, for tests that need
+    /// the *same* runtime instance (lease holder) to observe two different
+    /// runner answers across two separate `recover`/`resume` calls.
+    fn set_reconcile_outcome(&self, outcome: Result<ReconcileOutcome, ()>) {
+        *self
+            .reconcile_outcome
+            .lock()
+            .expect("reconcile lock poisoned") = outcome;
+    }
+
     fn start_calls(&self) -> usize {
         self.start_calls.load(Ordering::SeqCst)
     }
@@ -851,11 +867,12 @@ async fn build_running_attempt(
 
 /// Fully closes an Execution Episode (through `attempt.completed`,
 /// `rotation.requested`, and a committed Checkpoint) starting from a
-/// `Running` Attempt, then starts a fresh Verification Episode up to
-/// `session.started` — a `verification.completed` decision has *not* been
-/// recorded yet. This is failure point 5's fixture directly.
+/// `Running` Attempt, then starts a fresh Verification Episode and hydrates
+/// it — `session.started` has *not* been recorded yet. A crash exactly here
+/// (`StartEpisode` and `MarkHydrated` committed, `StartSession` not) is a
+/// real window: `advance` applies all three in one call.
 #[allow(clippy::too_many_arguments)]
-async fn build_verification_pending(
+async fn build_verification_episode_hydrated(
     ports: &RuntimePorts,
     loop_id: LoopId,
     work_unit: &WorkUnit,
@@ -863,7 +880,6 @@ async fn build_verification_pending(
     execution_session_id: SessionId,
     attempt_id: AttemptId,
     verification_episode_id: EpisodeId,
-    verification_session_id: SessionId,
 ) -> AggregateState {
     let state = build_running_attempt(
         ports,
@@ -918,7 +934,33 @@ async fn build_verification_pending(
         state.episode.as_ref().map(|episode| episode.kind),
         Some(EpisodeKind::Verification)
     );
-    let state = hydrate_and_mark(ports, &state, verification_episode_id, 2, work_unit).await;
+    hydrate_and_mark(ports, &state, verification_episode_id, 2, work_unit).await
+}
+
+/// As [`build_verification_episode_hydrated`], continued through
+/// `session.started` — a `verification.completed` decision has *not* been
+/// recorded yet. This is failure point 5's fixture directly.
+#[allow(clippy::too_many_arguments)]
+async fn build_verification_pending(
+    ports: &RuntimePorts,
+    loop_id: LoopId,
+    work_unit: &WorkUnit,
+    execution_episode_id: EpisodeId,
+    execution_session_id: SessionId,
+    attempt_id: AttemptId,
+    verification_episode_id: EpisodeId,
+    verification_session_id: SessionId,
+) -> AggregateState {
+    let state = build_verification_episode_hydrated(
+        ports,
+        loop_id,
+        work_unit,
+        execution_episode_id,
+        execution_session_id,
+        attempt_id,
+        verification_episode_id,
+    )
+    .await;
     step(
         &state,
         LifecycleCommand::StartSession {
@@ -1605,7 +1647,10 @@ async fn resume_reconciles_a_work_unit_stuck_suspended_by_a_verification_outcome
 /// refuses `StartEpisode`/`StartSession` unless something reconciles it
 /// first. `resume` must call into recovery to reconcile it (asking the
 /// runner before assuming the effect stopped) rather than resuming into an
-/// unsafe state.
+/// unsafe state. The runner here gives a *confirmed* answer (`NotStarted`):
+/// this is the safe half of the boundary — see
+/// `resume_refuses_when_recovery_cannot_confirm_a_dangling_attempt_is_safe`
+/// for the unsafe half, where an unconfirmed answer must NOT be retired.
 #[tokio::test]
 async fn resume_reconciles_a_dangling_attempt_left_by_a_mid_attempt_suspend() {
     let (ports, _broker, ids, store) = build_ports();
@@ -1672,7 +1717,7 @@ async fn resume_reconciles_a_dangling_attempt_left_by_a_mid_attempt_suspend() {
 
     let runner = Arc::new(ConfigurableRunner::new(
         attempt_id,
-        Ok(ReconcileOutcome::Unknown),
+        Ok(ReconcileOutcome::NotStarted),
     ));
     let service = RuntimeLoopService::new(controller(
         ports.clone(),
@@ -1767,7 +1812,412 @@ async fn resume_preserves_a_dangling_attempt_the_runner_reports_as_still_live() 
     );
 }
 
-async fn resume_loop(service: &RuntimeLoopService, loop_id: LoopId) {
+/// Important #2: `resume` must not report success while leaving the Loop in
+/// a state every subsequent `advance` will reject. When recovery cannot
+/// confirm a dangling Attempt's external effect is over (here: `Unknown`),
+/// `resume` re-suspends the Loop and refuses, rather than returning a bare
+/// `Ok` for a Loop that is `Active` in name only.
+#[tokio::test]
+async fn resume_refuses_when_recovery_cannot_confirm_a_dangling_attempt_is_safe() {
+    let (ports, _broker, ids, store) = build_ports();
+    let loop_id = ids.new_loop_id();
+    let work_unit = test_work_unit(ids.new_work_unit_id());
+    let episode_id = ids.new_episode_id();
+    let session_id = ids.new_session_id();
+    let attempt_id = ids.new_attempt_id();
+
+    let state = build_running_attempt(
+        &ports, loop_id, &work_unit, episode_id, session_id, attempt_id,
+    )
+    .await;
+    let state = step(
+        &state,
+        LifecycleCommand::Suspend {
+            reason: SuspensionReason::OperatorRequest,
+        },
+    );
+    let checkpoint2 = Checkpoint {
+        id: CheckpointId::new(),
+        loop_id,
+        version: state.checkpoint.version + 1,
+        aggregate_revision: state.execution.aggregate_revision,
+        parent: Some(state.checkpoint.id),
+        episode_id: Some(episode_id),
+        integrity_digest: None,
+    };
+    let state = step(
+        &state,
+        LifecycleCommand::CommitCheckpoint {
+            checkpoint: checkpoint2,
+        },
+    );
+    store.seed(loop_id, state);
+
+    let runner = Arc::new(ConfigurableRunner::new(
+        attempt_id,
+        Ok(ReconcileOutcome::Unknown),
+    ));
+    let service = RuntimeLoopService::new(controller(
+        ports.clone(),
+        Arc::clone(&runner) as Arc<dyn WorkUnitRunner>,
+    ));
+
+    let result = resume_loop_result(&service, loop_id).await;
+    let error =
+        result.expect_err("resume must refuse rather than report success it cannot back up");
+    assert_eq!(error.code, LoopwardErrorCode::RecoveryRequired);
+
+    let stored = ports.store.load(loop_id).await.expect("load succeeds");
+    assert_eq!(
+        stored.state.execution.status,
+        LoopStatus::Suspended,
+        "the loop must be left Suspended, not Active with an unreconciled attempt"
+    );
+    assert_eq!(
+        stored.state.attempt.as_ref().map(|a| a.status),
+        Some(AttemptStatus::Suspended)
+    );
+}
+
+/// A dangling Attempt whose runner confirms it actually `Completed` is not
+/// simply discarded (unlike a confirmed failure/cancellation): recovery
+/// collects the result, validates it against the Episode's originally
+/// hydrated pinned state, and folds it back in as a completed Attempt
+/// awaiting verification.
+#[tokio::test]
+async fn resume_recovers_a_dangling_attempts_completed_result_instead_of_discarding_it() {
+    let (ports, _broker, ids, store) = build_ports();
+    let loop_id = ids.new_loop_id();
+    let work_unit = test_work_unit(ids.new_work_unit_id());
+    let episode_id = ids.new_episode_id();
+    let session_id = ids.new_session_id();
+    let attempt_id = ids.new_attempt_id();
+
+    let state = build_running_attempt(
+        &ports, loop_id, &work_unit, episode_id, session_id, attempt_id,
+    )
+    .await;
+    let state = step(
+        &state,
+        LifecycleCommand::Suspend {
+            reason: SuspensionReason::OperatorRequest,
+        },
+    );
+    let checkpoint2 = Checkpoint {
+        id: CheckpointId::new(),
+        loop_id,
+        version: state.checkpoint.version + 1,
+        aggregate_revision: state.execution.aggregate_revision,
+        parent: Some(state.checkpoint.id),
+        episode_id: Some(episode_id),
+        integrity_digest: None,
+    };
+    let state = step(
+        &state,
+        LifecycleCommand::CommitCheckpoint {
+            checkpoint: checkpoint2,
+        },
+    );
+    store.seed(loop_id, state);
+
+    let runner = Arc::new(ConfigurableRunner::new(
+        attempt_id,
+        Ok(ReconcileOutcome::Completed),
+    ));
+    let manager = RecoveryManager::new(controller(
+        ports.clone(),
+        Arc::clone(&runner) as Arc<dyn WorkUnitRunner>,
+    ));
+
+    let outcome = manager.recover(loop_id).await.expect("recover succeeds");
+    assert_eq!(outcome, RecoveryOutcome::AttemptResultRecovered);
+    assert_eq!(runner.collect_calls(), 1);
+
+    let stored = ports.store.load(loop_id).await.expect("load succeeds");
+    assert_eq!(
+        stored.state.attempt.as_ref().map(|a| a.status),
+        Some(AttemptStatus::Succeeded)
+    );
+    assert!(stored.state.attempt.as_ref().unwrap().result_ref.is_some());
+    assert_eq!(
+        stored.state.work_unit.as_ref().map(|wu| wu.status),
+        Some(WorkUnitStatus::AwaitingVerification)
+    );
+}
+
+/// The runner itself suspended the run (still inside a live Episode):
+/// recovery preserves that suspension through the ordinary `Suspend`
+/// command rather than treating it as a failure.
+#[tokio::test]
+async fn in_episode_reconcile_suspended_preserves_the_runners_own_suspension() {
+    let (ports, _broker, ids, store) = build_ports();
+    let loop_id = ids.new_loop_id();
+    let work_unit = test_work_unit(ids.new_work_unit_id());
+    let episode_id = ids.new_episode_id();
+    let session_id = ids.new_session_id();
+    let attempt_id = ids.new_attempt_id();
+
+    let state = build_running_attempt(
+        &ports, loop_id, &work_unit, episode_id, session_id, attempt_id,
+    )
+    .await;
+    store.seed(loop_id, state);
+
+    let runner = Arc::new(ConfigurableRunner::new(
+        attempt_id,
+        Ok(ReconcileOutcome::Suspended),
+    ));
+    let manager = RecoveryManager::new(controller(
+        ports.clone(),
+        Arc::clone(&runner) as Arc<dyn WorkUnitRunner>,
+    ));
+
+    let outcome = manager.recover(loop_id).await.expect("recover succeeds");
+    assert!(matches!(outcome, RecoveryOutcome::LoopSuspended { .. }));
+
+    let stored = ports.store.load(loop_id).await.expect("load succeeds");
+    assert_eq!(stored.state.execution.status, LoopStatus::Suspended);
+    assert_eq!(
+        stored.state.attempt.as_ref().map(|a| a.status),
+        Some(AttemptStatus::Suspended)
+    );
+    assert!(stored.state.active_episode().is_none());
+}
+
+/// A confirmed runner failure (inside a live Episode) mandates closure:
+/// Core's only reachable terminal status from `Running` here is
+/// `Ambiguous`, and the Loop suspends. Per Important #3's fix, that
+/// `Ambiguous` Attempt is not a dead end: a later `resume` reconciles it
+/// too, asking the runner again before retiring it.
+#[tokio::test]
+async fn in_episode_reconcile_failed_marks_ambiguous_and_a_later_resume_clears_it() {
+    let (ports, _broker, ids, store) = build_ports();
+    let loop_id = ids.new_loop_id();
+    let work_unit = test_work_unit(ids.new_work_unit_id());
+    let episode_id = ids.new_episode_id();
+    let session_id = ids.new_session_id();
+    let attempt_id = ids.new_attempt_id();
+
+    let state = build_running_attempt(
+        &ports, loop_id, &work_unit, episode_id, session_id, attempt_id,
+    )
+    .await;
+    store.seed(loop_id, state);
+
+    let runner = Arc::new(ConfigurableRunner::new(
+        attempt_id,
+        Ok(ReconcileOutcome::Failed),
+    ));
+    // The same controller (and so the same lease-holder identity) drives
+    // both phases below: `InMemoryLoopStore::acquire_lease` — like the real
+    // store — rejects a second holder while the first holder's lease is
+    // still current, and this fake does not model TTL expiry.
+    let built_controller = controller(
+        ports.clone(),
+        Arc::clone(&runner) as Arc<dyn WorkUnitRunner>,
+    );
+    let manager = RecoveryManager::new(built_controller.clone());
+
+    let outcome = manager
+        .recover(loop_id)
+        .await
+        .expect("first recover suspends the loop");
+    assert!(matches!(outcome, RecoveryOutcome::LoopSuspended { .. }));
+
+    let stored = ports.store.load(loop_id).await.expect("load succeeds");
+    assert_eq!(stored.state.execution.status, LoopStatus::Suspended);
+    assert_eq!(
+        stored.state.attempt.as_ref().map(|a| a.status),
+        Some(AttemptStatus::Ambiguous),
+        "Core's mechanical closure of a confirmed failure inside a live episode is Ambiguous"
+    );
+    assert!(stored.state.active_episode().is_none());
+
+    // A later `resume` (through the service, not `RecoveryManager` directly)
+    // reconciles the now-`Ambiguous` Attempt exactly as it would a dangling
+    // `Suspended` one, once the runner gives a confirmed answer.
+    runner.set_reconcile_outcome(Ok(ReconcileOutcome::Cancelled));
+    let service = RuntimeLoopService::new(built_controller);
+    resume_loop(&service, loop_id).await;
+
+    let stored = ports.store.load(loop_id).await.expect("load succeeds");
+    assert_eq!(stored.state.execution.status, LoopStatus::Active);
+    assert_eq!(
+        stored.state.attempt.as_ref().map(|a| a.status),
+        Some(AttemptStatus::Cancelled),
+        "the Ambiguous Attempt must no longer be a dead end"
+    );
+    assert_eq!(
+        stored.state.work_unit.as_ref().map(|wu| wu.status),
+        Some(WorkUnitStatus::Pending)
+    );
+
+    let advance_outcome = service
+        .controller()
+        .advance(loop_id)
+        .await
+        .expect("the reconciled attempt no longer blocks advance");
+    assert!(matches!(
+        advance_outcome,
+        OperationOutcome::EpisodeCompleted { .. }
+    ));
+}
+
+/// A confirmed runner-side cancellation (inside a live Episode) is treated
+/// the same as a confirmed failure: Core's only reachable terminal status
+/// here is `Ambiguous`, and the Loop suspends.
+#[tokio::test]
+async fn in_episode_reconcile_cancelled_marks_ambiguous_and_suspends() {
+    let (ports, _broker, ids, store) = build_ports();
+    let loop_id = ids.new_loop_id();
+    let work_unit = test_work_unit(ids.new_work_unit_id());
+    let episode_id = ids.new_episode_id();
+    let session_id = ids.new_session_id();
+    let attempt_id = ids.new_attempt_id();
+
+    let state = build_running_attempt(
+        &ports, loop_id, &work_unit, episode_id, session_id, attempt_id,
+    )
+    .await;
+    store.seed(loop_id, state);
+
+    let runner = Arc::new(ConfigurableRunner::new(
+        attempt_id,
+        Ok(ReconcileOutcome::Cancelled),
+    ));
+    let manager = RecoveryManager::new(controller(
+        ports.clone(),
+        Arc::clone(&runner) as Arc<dyn WorkUnitRunner>,
+    ));
+
+    let outcome = manager.recover(loop_id).await.expect("recover succeeds");
+    assert!(matches!(outcome, RecoveryOutcome::LoopSuspended { .. }));
+
+    let stored = ports.store.load(loop_id).await.expect("load succeeds");
+    assert_eq!(
+        stored.state.attempt.as_ref().map(|a| a.status),
+        Some(AttemptStatus::Ambiguous)
+    );
+}
+
+/// The runner truthfully reports the Attempt was never started
+/// (`NotStarted`), but the fresh `start` call recovery itself issues fails:
+/// mandatory closure applies exactly as a graceful in-process runner
+/// failure would (`ConfigurableRunner::fail_start`, previously unexercised
+/// by any test).
+#[tokio::test]
+async fn recovery_start_failure_suspends_the_loop_and_commits() {
+    let (ports, _broker, ids, store) = build_ports();
+    let loop_id = ids.new_loop_id();
+    let work_unit = test_work_unit(ids.new_work_unit_id());
+    let episode_id = ids.new_episode_id();
+    let session_id = ids.new_session_id();
+    let attempt_id = ids.new_attempt_id();
+
+    let state = build_prepared_attempt(
+        &ports, loop_id, &work_unit, episode_id, session_id, attempt_id,
+    )
+    .await;
+    store.seed(loop_id, state);
+
+    let runner = Arc::new(
+        ConfigurableRunner::new(attempt_id, Ok(ReconcileOutcome::NotStarted)).failing_to_start(),
+    );
+    let manager = RecoveryManager::new(controller(
+        ports.clone(),
+        Arc::clone(&runner) as Arc<dyn WorkUnitRunner>,
+    ));
+
+    let outcome = manager.recover(loop_id).await.expect("recover succeeds");
+    assert!(matches!(outcome, RecoveryOutcome::LoopSuspended { .. }));
+    assert_eq!(runner.start_calls(), 1);
+
+    let stored = ports.store.load(loop_id).await.expect("load succeeds");
+    assert_eq!(stored.state.execution.status, LoopStatus::Suspended);
+    let rotation_reason = stored
+        .events
+        .iter()
+        .find_map(|recorded| match &recorded.event {
+            LoopEvent::RotationRequested { reason, .. } => Some(*reason),
+            _ => None,
+        });
+    assert_eq!(rotation_reason, Some(RotationReason::RunnerFailure));
+}
+
+/// A Verification Episode that crashes before `session.started` (a real
+/// window: `advance` applies `StartEpisode`, hydrates, then `StartSession`,
+/// all in one call) must be recovered *as* a Verification Episode — not
+/// mis-attributed as an Execution Episode's `WorkUnitBoundary` rotation.
+#[tokio::test]
+async fn verification_episode_crash_before_session_start_is_recovered_as_verification() {
+    let (ports, _broker, ids, store) = build_ports();
+    let loop_id = ids.new_loop_id();
+    let work_unit = test_work_unit(ids.new_work_unit_id());
+    let execution_episode_id = ids.new_episode_id();
+    let execution_session_id = ids.new_session_id();
+    let attempt_id = ids.new_attempt_id();
+    let verification_episode_id = ids.new_episode_id();
+
+    let state = build_verification_episode_hydrated(
+        &ports,
+        loop_id,
+        &work_unit,
+        execution_episode_id,
+        execution_session_id,
+        attempt_id,
+        verification_episode_id,
+    )
+    .await;
+    assert_eq!(
+        state.episode.as_ref().map(|episode| episode.status),
+        Some(EpisodeStatus::Hydrating)
+    );
+    assert_eq!(
+        state.episode.as_ref().map(|episode| episode.kind),
+        Some(EpisodeKind::Verification)
+    );
+    store.seed(loop_id, state);
+
+    let runner = Arc::new(ConfigurableRunner::new(
+        attempt_id,
+        Ok(ReconcileOutcome::Unknown),
+    ));
+    let manager = RecoveryManager::new(controller(
+        ports.clone(),
+        Arc::clone(&runner) as Arc<dyn WorkUnitRunner>,
+    ));
+
+    let outcome = manager.recover(loop_id).await.expect("recover succeeds");
+    assert!(matches!(outcome, RecoveryOutcome::EpisodeRecovered { .. }));
+    assert_eq!(
+        runner.reconcile_calls(),
+        0,
+        "verification never consults the runner"
+    );
+
+    let stored = ports.store.load(loop_id).await.expect("load succeeds");
+    let rotation_reason = stored
+        .events
+        .iter()
+        .find_map(|recorded| match &recorded.event {
+            LoopEvent::RotationRequested { reason, .. } => Some(*reason),
+            _ => None,
+        });
+    assert_eq!(
+        rotation_reason,
+        Some(RotationReason::VerificationBoundary),
+        "must be attributed as a verification boundary, not a work unit boundary"
+    );
+    assert_eq!(
+        stored.state.work_unit.as_ref().map(|wu| wu.status),
+        Some(WorkUnitStatus::Accepted)
+    );
+}
+
+async fn resume_loop_result(
+    service: &RuntimeLoopService,
+    loop_id: LoopId,
+) -> Result<loopward_api::loop_service::OperationHandle, loopward_api::error::LoopwardError> {
     let command = ResumeLoopCommand {
         metadata: CommandMetadata {
             request_id: "req-resume".to_owned(),
@@ -1778,7 +2228,11 @@ async fn resume_loop(service: &RuntimeLoopService, loop_id: LoopId) {
         },
         loop_id,
     };
-    loopward_api::loop_service::LoopService::resume(service, command)
+    loopward_api::loop_service::LoopService::resume(service, command).await
+}
+
+async fn resume_loop(service: &RuntimeLoopService, loop_id: LoopId) {
+    resume_loop_result(service, loop_id)
         .await
         .expect("resume succeeds");
 }

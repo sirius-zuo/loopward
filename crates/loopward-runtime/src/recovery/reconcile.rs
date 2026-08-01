@@ -216,6 +216,22 @@ impl RecoveryManager {
             .clone()
             .ok_or(ControllerError::NoWorkUnit(loop_id))?;
         let session_generation = state.latest_generation() + 1;
+        // Captured before any further reconciliation reassigns `state`:
+        // `episode.kind` never changes across `MarkHydrated`/`StartSession`,
+        // but a Verification Episode that crashes this early (a real
+        // window: `advance` applies `StartEpisode`, hydrates, then
+        // `StartSession`, all in one call) must still be recovered as one —
+        // hardcoding `Execution` here would durably misattribute its
+        // rotation reason.
+        let kind = state
+            .episode
+            .as_ref()
+            .map(|episode| episode.kind)
+            .ok_or_else(|| {
+                ControllerError::Invariant(
+                    "recovering an Episode with no kind on record".to_owned(),
+                )
+            })?;
 
         let needs_hydration = state
             .episode
@@ -265,8 +281,7 @@ impl RecoveryManager {
             )
             .await?;
 
-        Box::pin(self.recover_executing(loop_id, lease, state, episode_id, EpisodeKind::Execution))
-            .await
+        Box::pin(self.recover_executing(loop_id, lease, state, episode_id, kind)).await
     }
 
     /// The Episode's Runtime Session is live (`Executing`); dispatches on
