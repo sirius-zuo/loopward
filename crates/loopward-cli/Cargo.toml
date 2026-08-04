@@ -8,4 +8,27 @@ license.workspace = true
 [lints]
 workspace = true
 
+[[bin]]
+name = "loopward"
+path = "src/main.rs"
+
 [dependencies]
+async-trait = { workspace = true }
+clap = { workspace = true }
+loopward-api = { path = "../loopward-api" }
+loopward-observability = { path = "../loopward-observability" }
+loopward-observability-otel = { path = "../loopward-observability-otel" }
+loopward-runner-command = { path = "../loopward-runner-command" }
+loopward-runtime = { path = "../loopward-runtime" }
+loopward-store-sqlite = { path = "../loopward-store-sqlite" }
+opentelemetry-otlp = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true, features = ["parsing"] }
+tokio = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+assert_cmd = { workspace = true }
+tempfile = { workspace = true }
