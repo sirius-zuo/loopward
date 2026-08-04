@@ -1,0 +1,75 @@
+{
+  "protocol_version": "loopward.work-unit-protocol/v0.1",
+  "loop": {
+    "kind": "loopward.reference-scenario/rust-maintenance",
+    "goal": "Stabilize the flaky `retry_backoff` unit test without changing its public contract.",
+    "domain_schema": "loopward.reference-scenario/v0.1",
+    "success_criteria": [
+      {
+        "id": "criterion-001",
+        "statement": "`retry_backoff`'s test suite passes deterministically under the pinned verification command.",
+        "status": "pending"
+      }
+    ]
+  },
+  "pinned_constraints": [
+    {
+      "id": "constraint-public-contract",
+      "statement": "The public signature of `retry_backoff` must not change.",
+      "source": "user",
+      "scope": "loop"
+    }
+  ],
+  "work_units": [
+    {
+      "ordinal": 1,
+      "phase": "inspect",
+      "objective": "Inspect the failing test and reproduce the flake.",
+      "expected_runner_outcome": "runner_failure",
+      "expected_recovery": "the interrupted first Attempt is reconciled as never started, and the Loop resumes ready for a fresh Attempt"
+    },
+    {
+      "ordinal": 2,
+      "phase": "implement",
+      "objective": "Implement a fix for the flaky test without changing its public contract.",
+      "expected_runner_outcome": "produced"
+    },
+    {
+      "ordinal": 3,
+      "phase": "verify",
+      "objective": "Run the pinned deterministic verification command against the implemented fix.",
+      "verification": {
+        "kind": "deterministic",
+        "command": "test -f \"$REMEDIATION_MARKER\"",
+        "expected_exit_code": 0
+      },
+      "expected_verification_outcome": "rejected",
+      "expected_finding_code": "verification.deterministic.unexpected_exit"
+    },
+    {
+      "ordinal": 4,
+      "phase": "remediate",
+      "objective": "Land the remediation: produce the state the deterministic check requires.",
+      "expected_runner_outcome": "produced",
+      "remediation_of_finding": "verification.deterministic.unexpected_exit"
+    },
+    {
+      "ordinal": 5,
+      "phase": "final_verify",
+      "objective": "Re-run the pinned deterministic verification command against the remediated fix.",
+      "verification": {
+        "kind": "deterministic",
+        "command": "test -f \"$REMEDIATION_MARKER\"",
+        "expected_exit_code": 0
+      },
+      "expected_verification_outcome": "accepted"
+    }
+  ],
+  "completion_gate": {
+    "criterion": "criterion-001",
+    "requires_current_evidence": true
+  },
+  "notes": [
+    "Loopward's runtime carries exactly one Work Unit per Loop for its whole lifetime (loopward-runtime/src/controller/advance.rs's own module doc: 'Phase One's controller carries exactly one Work Unit per Loop; once it is terminal, nothing remains to attempt'); no LifecycleCommand assigns or replaces one. The five entries above are the five phases of that one Work Unit's lifecycle -- five real Episodes (Execution/Verification alternating), not five distinct WorkUnitIds -- and crates/loopward-cli/tests/e2e_phase_one.rs drives them as such. The rejected verification's remediation is a second Attempt of the same Work Unit, not a second Work Unit."
+  ]
+}

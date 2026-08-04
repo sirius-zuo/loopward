@@ -989,11 +989,13 @@ dependencies = [
  "async-trait",
  "clap",
  "loopward-api",
+ "loopward-core",
  "loopward-observability",
  "loopward-observability-otel",
  "loopward-runner-command",
  "loopward-runtime",
  "loopward-store-sqlite",
+ "loopward-testkit",
  "opentelemetry-otlp",
  "serde",
  "serde_json",
@@ -1089,6 +1091,19 @@ dependencies = [
 [[package]]
 name = "loopward-testkit"
 version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "loopward-api",
+ "loopward-core",
+ "loopward-observability",
+ "loopward-runtime",
+ "loopward-store-sqlite",
+ "serde_json",
+ "tempfile",
+ "time",
+ "tokio",
+ "uuid",
+]
 
 [[package]]
 name = "md-5"
