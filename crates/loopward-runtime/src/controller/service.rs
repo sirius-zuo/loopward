@@ -217,7 +217,7 @@ impl loopward_api::loop_service::LoopService for RuntimeLoopService {
             .acquire_lease(crate::ports::AcquireLease {
                 loop_id,
                 holder_id: self.controller.holder_id(),
-                ttl: time::Duration::seconds(60),
+                ttl: self.controller.lease_ttl(),
             })
             .await
             .map_err(|error| store_error(&error))?;

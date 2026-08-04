@@ -19,6 +19,19 @@ use tempfile::TempDir;
 const CREATE_SPEC: &str =
     r#"{"kind":"demo","goal":"ship the thing","domain_schema":"demo.schema.v1"}"#;
 
+/// The `--lease-seconds` value [`full_lifecycle_via_the_cli`] passes to
+/// every lease-acquiring command, `create` included, now that
+/// `RuntimeLoopService::create` honors the configured lease TTL rather than
+/// a hardcoded 60 seconds. Short enough to keep the whole test's real sleep
+/// time in the low single-digit seconds.
+const TEST_LEASE_SECONDS: &str = "2";
+
+/// How long [`full_lifecycle_via_the_cli`] sleeps between two commands that
+/// must not hold the lease concurrently: just past [`TEST_LEASE_SECONDS`],
+/// so the next command's lease acquisition is guaranteed to see the prior
+/// one expired.
+const TEST_LEASE_SLEEP: Duration = Duration::from_millis(2_500);
+
 /// Builds a `loopward` invocation rooted at `temp`'s database, resource, and
 /// run directories, so this test's process never touches the real
 /// filesystem outside its own temp directory.
@@ -47,6 +60,27 @@ fn json_data(stdout: &[u8]) -> Value {
 fn create_loop(temp: &TempDir) -> String {
     let assert = loopward(temp)
         .args(["create", "--spec", CREATE_SPEC, "--json"])
+        .assert()
+        .success();
+    let data = json_data(&assert.get_output().stdout);
+    data["loop_id"]
+        .as_str()
+        .expect("created loop handle should carry a loop_id")
+        .to_owned()
+}
+
+/// Like [`create_loop`], but requests `lease_seconds` for the genesis lease
+/// `create` itself acquires, rather than relying on the CLI's default.
+fn create_loop_with_lease_seconds(temp: &TempDir, lease_seconds: &str) -> String {
+    let assert = loopward(temp)
+        .args([
+            "create",
+            "--spec",
+            CREATE_SPEC,
+            "--json",
+            "--lease-seconds",
+            lease_seconds,
+        ])
         .assert()
         .success();
     let data = json_data(&assert.get_output().stdout);
@@ -135,8 +169,9 @@ fn run_without_any_finite_limit_is_rejected_as_invalid_request() {
 
 /// `create` acquires a real, durable execution lease as part of committing
 /// the genesis Checkpoint (`RuntimeLoopService::create`), held by *that
-/// invocation's own* `LoopController`, for a fixed 60 real seconds —
-/// hardcoded there, not configurable through this CLI's `--lease-seconds`.
+/// invocation's own* `LoopController`, for this CLI's configured
+/// `--lease-seconds` (defaulted here, since this test doesn't pass one, to
+/// `DEFAULT_LEASE_SECONDS`'s 60 real seconds).
 /// Every subsequent `loopward` invocation is a fresh process with its own
 /// randomly generated runtime instance identity
 /// (`LoopController::new`'s `RuntimeInstanceId::new()`), and Loopward's
@@ -202,12 +237,12 @@ fn advance_and_run_conflict_with_the_lease_create_still_holds() {
 /// Loop's lifecycle — including the state transitions `suspend`/`resume`/
 /// `cancel` drive.
 ///
-/// This test pays the real 60-second cost documented on
-/// [`advance_and_run_conflict_with_the_lease_create_still_holds`] once, by
-/// waiting out `create`'s hardcoded lease, so the rest of the lifecycle can
-/// proceed as separate CLI processes; every command after that wait passes
-/// a short `--lease-seconds` and this test sleeps past it between commands,
-/// so no single wait needs to be the full 60 seconds again.
+/// `create`'s genesis lease is configurable (`RuntimeLoopService::create`
+/// honors `LoopController::lease_ttl`, the same TTL every other
+/// lease-acquiring command uses), so this test passes a short
+/// `--lease-seconds` — [`TEST_LEASE_SECONDS`] — to *every* command,
+/// including `create`, and sleeps just past that short TTL between
+/// commands rather than paying a fixed, unrelated real-time cost.
 ///
 /// `advance` and `run --max-episodes` are still expected to fail once the
 /// lease is available, not succeed: Phase One's `RuntimeLoopService::create`
@@ -224,17 +259,17 @@ fn full_lifecycle_via_the_cli() {
 
     loopward(&temp).arg("init").assert().success();
 
-    let loop_id = create_loop(&temp);
+    let loop_id = create_loop_with_lease_seconds(&temp, TEST_LEASE_SECONDS);
 
-    // Wait out `create`'s hardcoded 60-second lease so the next command,
-    // a separate process with its own runtime instance identity, can
-    // acquire it at all (see this test's doc comment).
-    std::thread::sleep(Duration::from_secs(62));
+    // Wait just past `create`'s short, configured lease so the next
+    // command, a separate process with its own runtime instance identity,
+    // can acquire it (see this test's doc comment).
+    std::thread::sleep(TEST_LEASE_SLEEP);
 
     // advance: fails cleanly (no work unit assigned) rather than panicking,
     // now that the lease itself is available.
     let assert = loopward(&temp)
-        .args(["advance", &loop_id, "--lease-seconds", "2"])
+        .args(["advance", &loop_id, "--lease-seconds", TEST_LEASE_SECONDS])
         .assert()
         .failure();
     let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
@@ -243,7 +278,7 @@ fn full_lifecycle_via_the_cli() {
         "expected an invalid_request error, stderr was: {stderr}"
     );
 
-    std::thread::sleep(Duration::from_millis(2500));
+    std::thread::sleep(TEST_LEASE_SLEEP);
 
     // run --max-episodes 2: same underlying NoWorkUnit failure, reached
     // through run_until's internal advance loop instead of a direct
@@ -255,7 +290,7 @@ fn full_lifecycle_via_the_cli() {
             "--max-episodes",
             "2",
             "--lease-seconds",
-            "2",
+            TEST_LEASE_SECONDS,
         ])
         .assert()
         .failure();
@@ -287,7 +322,7 @@ fn full_lifecycle_via_the_cli() {
         .expect("events should be an array");
     assert!(!events.is_empty(), "expected at least one durable event");
 
-    std::thread::sleep(Duration::from_millis(2500));
+    std::thread::sleep(TEST_LEASE_SLEEP);
 
     // suspend: active -> suspended.
     loopward(&temp)
@@ -297,7 +332,7 @@ fn full_lifecycle_via_the_cli() {
             "--reason",
             "operator pause",
             "--lease-seconds",
-            "2",
+            TEST_LEASE_SECONDS,
         ])
         .assert()
         .success();
@@ -308,11 +343,11 @@ fn full_lifecycle_via_the_cli() {
     let data = json_data(&assert.get_output().stdout);
     assert_eq!(data["status"], Value::String("suspended".to_owned()));
 
-    std::thread::sleep(Duration::from_millis(2500));
+    std::thread::sleep(TEST_LEASE_SLEEP);
 
     // resume: suspended -> active (no dangling attempt to recover).
     loopward(&temp)
-        .args(["resume", &loop_id, "--lease-seconds", "2"])
+        .args(["resume", &loop_id, "--lease-seconds", TEST_LEASE_SECONDS])
         .assert()
         .success();
     let assert = loopward(&temp)
@@ -322,7 +357,7 @@ fn full_lifecycle_via_the_cli() {
     let data = json_data(&assert.get_output().stdout);
     assert_eq!(data["status"], Value::String("active".to_owned()));
 
-    std::thread::sleep(Duration::from_millis(2500));
+    std::thread::sleep(TEST_LEASE_SLEEP);
 
     // cancel: active -> terminal.
     loopward(&temp)
@@ -332,7 +367,7 @@ fn full_lifecycle_via_the_cli() {
             "--reason",
             "no longer needed",
             "--lease-seconds",
-            "2",
+            TEST_LEASE_SECONDS,
         ])
         .assert()
         .success();
