@@ -63,10 +63,17 @@ fn fixture_output() -> ResourceRef {
     }
 }
 
-/// One Work Unit protocol fixture request. Every field is fixed except the
-/// Attempt identity, so the identical shape can be handed to both runner
-/// profiles.
-fn fixture_request(attempt_id: AttemptId) -> WorkUnitRequest {
+/// The one shared Work Unit protocol fixture request, built exactly once.
+/// Every field is fixed; the returned value carries a placeholder
+/// `attempt_id` that every caller overrides via [`with_attempt_id`] before
+/// handing a copy to a runner. `attempt_id` is the only field that
+/// legitimately varies per profile run — each Attempt has its own durable
+/// identity — so it is deliberately the one thing [`with_attempt_id`]
+/// changes, leaving `loop_id`, `episode_id`, `session_id`, `work_unit_id`,
+/// and everything else genuinely identical between profiles, rather than
+/// freshly (and differently) generated per call.
+fn fixture_request_base() -> WorkUnitRequest {
+    let placeholder_attempt_id = AttemptId::new();
     let loop_id = LoopId::new();
     let episode_id = EpisodeId::new();
     let work_unit_id = WorkUnitId::new();
@@ -142,7 +149,7 @@ fn fixture_request(attempt_id: AttemptId) -> WorkUnitRequest {
         session_id: SessionId::new(),
         session_generation: 1,
         work_unit,
-        attempt_id,
+        attempt_id: placeholder_attempt_id,
         idempotency_key: "runner-profile-parity-1".to_owned(),
         boot_package,
         resource_grants: vec![],
@@ -156,6 +163,17 @@ fn fixture_request(attempt_id: AttemptId) -> WorkUnitRequest {
             tracestate: None,
             baggage: vec![],
         },
+    }
+}
+
+/// Returns a copy of the shared `base` fixture request with `attempt_id`
+/// overridden to this profile's Attempt identity. Every other field is
+/// carried over unchanged from `base`, so the two profiles' requests differ
+/// in exactly one field, not four.
+fn with_attempt_id(base: &WorkUnitRequest, attempt_id: AttemptId) -> WorkUnitRequest {
+    WorkUnitRequest {
+        attempt_id,
+        ..base.clone()
     }
 }
 
@@ -293,13 +311,17 @@ fn command_runner_in(dir: &tempfile::TempDir) -> CommandRunner {
 
 #[tokio::test]
 async fn two_different_runner_profiles_complete_the_same_work_unit_protocol_fixture() {
+    // The one shared Work Unit protocol fixture request, built exactly once
+    // and reused (via `with_attempt_id`) by both profiles below.
+    let base_request = fixture_request_base();
+
     // Profile 1: the real external-process adapter (Task 7), invoking a
     // small, deterministic, portable shell command.
     let dir = tempfile::tempdir().expect("create temp dir");
     let command_runner = command_runner_in(&dir);
     let command_attempt_id = AttemptId::new();
     let command_handle = command_runner
-        .start(fixture_request(command_attempt_id))
+        .start(with_attempt_id(&base_request, command_attempt_id))
         .await
         .expect("the command runner starts the fixture");
     let command_result = command_runner
@@ -317,7 +339,7 @@ async fn two_different_runner_profiles_complete_the_same_work_unit_protocol_fixt
         AttemptScript::succeeding_with(expected_result(fake_attempt_id)),
     );
     let fake_handle = fake_runner
-        .start(fixture_request(fake_attempt_id))
+        .start(with_attempt_id(&base_request, fake_attempt_id))
         .await
         .expect("the fake runner starts the fixture");
     let fake_result = fake_runner
