@@ -374,8 +374,7 @@ final whole-branch review's fix round. Neither is a bug; both are
 deliberate Phase One scope boundaries, recorded here explicitly rather than
 left as silent gaps.
 
-### 10.1 No `release_lease` mechanism; `create` immediately followed by a
-separate CLI invocation deterministically fails `lease_unavailable`
+### 10.1 No `release_lease` mechanism; `create` immediately followed by a separate CLI invocation deterministically fails `lease_unavailable`
 
 No `release_lease` method (or equivalent) exists anywhere in the
 `LoopStore` trait or any of its implementations
