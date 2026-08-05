@@ -297,7 +297,7 @@ the *same* fixture or scenario through both and asserts equivalent outcomes:
 - `crates/loopward-cli/tests/e2e_phase_one.rs` exercises `FakeRunner`
   exclusively against `retry-loop.json`.
 - `crates/loopward-cli/src/commands.rs` wires `CommandRunner` as the real
-  runner behind the CLI's `--runner-command` composition path, but
+  runner behind the CLI's `--runner-profile` composition path, but
   `cli_contract.rs` does not use `CommandRunner` in its lifecycle test (it
   relies on the CLI's `NullRunner`/default path), and in any case does not
   run the same fixture that `e2e_phase_one.rs` runs through `FakeRunner`.
@@ -367,7 +367,62 @@ and `loopward-store-sqlite`) all pass, and no discrepancy between the Rust
 types and the YAML schemas was found during this run. No schema edits were
 necessary or made.
 
-## 10. Commands executed (verbatim, in order)
+## 10. Known Phase One limitations (deviations)
+
+Two accepted, narrow scope limitations were confirmed while addressing the
+final whole-branch review's fix round. Neither is a bug; both are
+deliberate Phase One scope boundaries, recorded here explicitly rather than
+left as silent gaps.
+
+### 10.1 No `release_lease` mechanism; `create` immediately followed by a
+separate CLI invocation deterministically fails `lease_unavailable`
+
+No `release_lease` method (or equivalent) exists anywhere in the
+`LoopStore` trait or any of its implementations
+(`crates/loopward-store-sqlite`, the in-memory test doubles). Combined with
+the CLI's one-process-per-invocation model (`LoopController::new` mints a
+fresh, randomly generated `RuntimeInstanceId` every time the `loopward`
+binary starts) and the default 60-second lease TTL
+(`DEFAULT_LEASE_SECONDS`), running `loopward create` and then, as a
+*separate* process invocation, `loopward advance` (or `run`, `suspend`,
+`resume`, `cancel`) deterministically fails with `lease_unavailable` until
+either the `create` invocation's lease naturally expires or a shorter
+`--lease-seconds` is explicitly configured.
+
+This is exercised and asserted as expected, working-as-shipped behavior —
+not a defect — by `crates/loopward-cli/tests/cli_contract.rs`'s
+`advance_and_run_conflict_with_the_lease_create_still_holds` test, which
+drives exactly this sequence and asserts a clean `lease_unavailable`
+failure (never a panic, never a silent hang) on the very next
+lease-acquiring command.
+
+A future daemon/service mode that keeps a single long-lived
+`LoopController`/`RuntimeInstanceId` alive across what are today separate
+CLI invocations would not hit this at all (the same instance can simply
+reacquire its own unexpired lease). Absent that, closing this gap for the
+current one-shot-per-process CLI would need either a `release_lease` port
+method on `LoopStore`, or a caller-supplied stable holder identity shared
+across invocations (so a later invocation is recognized as the same
+holder rather than a competing one) — both are new scope, not implemented
+in Phase One, and deliberately not added as part of this fix round: adding
+`release_lease` this late would touch `LoopStore`'s trait contract and the
+recovery invariants built on top of lease fencing, for a documentation gap
+rather than a demonstrated correctness bug.
+
+### 10.2 `RetryPolicy` is declared in the wire contract but read by no code
+
+`loopward_api::work_unit::RetryPolicy` is a real, serializable type on the
+wire contract (`WorkUnit::retry_policy`, `crates/loopward-api/src/work_unit.rs`),
+but no code in `loopward-core` or `loopward-runtime` ever reads a
+`WorkUnit`'s `retry_policy` field — no reducer, policy, or rotation
+decision inspects it. It round-trips through serialization (covered by
+`loopward-api`'s `contract_roundtrip.rs`) but has no behavioral effect
+anywhere in Phase One's runtime. This is a known, accepted scope
+limitation for Phase One, not an oversight to be silently left as unused
+API surface: retry-policy enforcement is unimplemented and deferred to a
+later phase.
+
+## 11. Commands executed (verbatim, in order)
 
 ```bash
 rg -n "Aether|OrchestrationProvider|DAG|workflow topology|agent registry" crates
@@ -382,7 +437,7 @@ cargo test -p loopward-runtime --test context_hydration
 cargo test -p loopward-observability-otel --test episode_links
 ```
 
-## 11. Summary
+## 12. Summary
 
 Phase One's deterministic-conformance evidence is complete and passing:
 204/204 tests green, zero Clippy warnings, `fmt` clean, all eight recovery

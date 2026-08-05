@@ -997,7 +997,10 @@ impl LoopController {
                 SuspensionReason::Recovery,
             )
             .await?;
-            episode_span.set_end_attribute(attribute::ROTATION_REASON, "runner_failure");
+            episode_span.set_end_attribute(
+                attribute::ROTATION_REASON,
+                RotationReason::RunnerFailure.label(),
+            );
             episode_span.set_end_attribute(attribute::OUTCOME, "suspended");
             return Ok(OperationOutcome::Suspended);
         };
@@ -1047,7 +1050,10 @@ impl LoopController {
                 SuspensionReason::Recovery,
             )
             .await?;
-            episode_span.set_end_attribute(attribute::ROTATION_REASON, "runner_failure");
+            episode_span.set_end_attribute(
+                attribute::ROTATION_REASON,
+                RotationReason::RunnerFailure.label(),
+            );
             episode_span.set_end_attribute(attribute::OUTCOME, "suspended");
             return Ok(OperationOutcome::Suspended);
         };
@@ -1608,7 +1614,11 @@ impl LoopController {
     ) -> Result<AggregateState, ControllerError> {
         let mut span = Span::start(
             &self.ports.telemetry,
-            SpanStart::new(span_name::CHECKPOINT_COMMIT)
+            self.trace_continuity_context(loop_id)
+                .map_or_else(
+                    || SpanStart::new(span_name::CHECKPOINT_COMMIT),
+                    |parent| SpanStart::new(span_name::CHECKPOINT_COMMIT).with_parent(parent),
+                )
                 .with_attribute(attribute::LOOP_ID, loop_id.to_string())
                 .with_attribute(
                     attribute::CHECKPOINT_VERSION,
@@ -1616,8 +1626,8 @@ impl LoopController {
                 ),
         );
         if let Some(reason) = rotation_reason {
-            let label = format!("{reason:?}");
-            span.set_end_attribute(attribute::ROTATION_REASON, label.clone());
+            let label = reason.label();
+            span.set_end_attribute(attribute::ROTATION_REASON, label);
             span.event(
                 TelemetryEvent::new(event_name::ROTATION_REQUESTED)
                     .with_attribute(attribute::ROTATION_REASON, label),

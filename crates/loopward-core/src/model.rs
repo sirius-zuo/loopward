@@ -668,6 +668,27 @@ impl RotationReason {
     pub fn is_runner_failure(self) -> bool {
         matches!(self, Self::RunnerFailure)
     }
+
+    /// The stable `snake_case` label used in diagnostics and errors.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::WorkUnitBoundary => "work_unit_boundary",
+            Self::PhaseBoundary => "phase_boundary",
+            Self::VerificationBoundary => "verification_boundary",
+            Self::RemediationBoundary => "remediation_boundary",
+            Self::GoalLocalityShift => "goal_locality_shift",
+            Self::SoftContextBudget => "soft_context_budget",
+            Self::HardContextBudget => "hard_context_budget",
+            Self::ContextIntegrityFailure => "context_integrity_failure",
+            Self::ContextEntropySignal => "context_entropy_signal",
+            Self::RunnerCompaction => "runner_compaction",
+            Self::RunnerFailure => "runner_failure",
+            Self::Recovery => "recovery",
+            Self::Policy => "policy",
+            Self::OperatorRequest => "operator_request",
+        }
+    }
 }
 
 /// A versioned, authoritative snapshot: the durable continuation boundary

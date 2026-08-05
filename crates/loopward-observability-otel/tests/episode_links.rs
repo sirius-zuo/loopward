@@ -798,6 +798,39 @@ async fn two_episodes_produce_linked_traces_with_propagated_runner_context() {
         episode_one.span_context.trace_id(),
         "the runner boundary span must nest under the Execution Episode's trace"
     );
+
+    // Each `loopward.checkpoint.commit` span must nest under the trace of
+    // the Episode that produced it, not stand alone as its own trace root
+    // (a prior bug this asserts against: `commit()` used to start its span
+    // with no parent at all).
+    let commit_spans: Vec<_> = spans
+        .iter()
+        .filter(|span| span.name == "loopward.checkpoint.commit")
+        .collect();
+    assert_eq!(
+        commit_spans.len(),
+        2,
+        "expected one checkpoint-commit span per Episode"
+    );
+    for span in &commit_spans {
+        let commit_checkpoint_version = span
+            .attributes
+            .iter()
+            .find(|kv| kv.key.as_str() == "loopward.checkpoint.version")
+            .and_then(|kv| kv.value.as_str().parse::<u64>().ok())
+            .expect("commit span records a checkpoint version");
+        let expected_trace_id = if commit_checkpoint_version == checkpoint_one {
+            episode_one.span_context.trace_id()
+        } else {
+            assert_eq!(commit_checkpoint_version, checkpoint_two);
+            episode_two.span_context.trace_id()
+        };
+        assert_eq!(
+            span.span_context.trace_id(),
+            expected_trace_id,
+            "the checkpoint-commit span must nest under its own Episode's trace"
+        );
+    }
 }
 
 /// `docs/08` §12/§15: "traces contain no full prompt or resource payload by
