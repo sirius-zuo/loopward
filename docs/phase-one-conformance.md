@@ -22,7 +22,7 @@ unresolved; it is unrelated to this addendum and is not addressed here.
 
 | Field | Value |
 | --- | --- |
-| Commit SHA | `ce8d6e1ac2c22b66428c8f73ea5a788502b551c8` |
+| Commit SHA | `cb03b57fb75484bc3d3286af8f571ff8b2ae9cf2` |
 | Working tree | clean at time of this run (`git status --short` empty) |
 | `rustc --version` | `rustc 1.97.1 (8bab26f4f 2026-07-14)` |
 | `cargo --version` | `cargo 1.97.1 (c980f4866 2026-06-30)` |
