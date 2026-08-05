@@ -11,6 +11,13 @@ workspace. Neither is fixed here — both are outside this task's file list
 and the second would require new test infrastructure, not a documentation
 change.
 
+**Task 15 addendum (post-Task-14):** the second gap — the runner-profile-parity
+criterion — has since been closed by a narrowly-scoped new test,
+`crates/loopward-cli/tests/runner_profile_parity.rs`, added specifically to
+close this acceptance gate (not part of the original 14-task file list). See
+§8 below for the updated account. The `cargo doc` warnings gap remains
+unresolved; it is unrelated to this addendum and is not addressed here.
+
 ## 1. Build identification
 
 | Field | Value |
@@ -259,10 +266,10 @@ either a value actually produced by a passing test in this run, or marked
 | The runtime operates with tracing disabled | **Pass** | §5.5 above — `NoopTelemetrySink` path exercised by `e2e_phase_one.rs` |
 | The runtime operates without a telemetry backend | **Pass** | §5.5 above — no OTLP endpoint, no external service, in any passing test |
 | No Aether or orchestration concept appears in Core | **Pass** | §2 above |
-| At least two different command-runner profiles complete the same Work Unit protocol fixture | **Not demonstrated — genuine gap** | See §8 below |
+| At least two different command-runner profiles complete the same Work Unit protocol fixture | **Pass** | See §8 below (Task 15 addendum) — `crates/loopward-cli/tests/runner_profile_parity.rs` |
 | The evaluation report clearly distinguishes known, estimated, and unavailable token data | **Pass (template); no filled instance exists yet** | `docs/phase-one-evaluation-template.md` (built in Task 13) defines this structure and requires `unavailable` to be written explicitly rather than left blank; §6 of this document is itself one filled instance, scoped to the deterministic-conformance data produced by this run only. No real-runner evaluation instance of the template has been filled in (none can be, absent a configured real agent command) |
 
-## 8. Command-runner-profile parity — honest unmet criterion
+## 8. Command-runner-profile parity — closed by Task 15
 
 `docs/10-mvp-and-evaluation.md` §13 requires "at least two different
 command-runner profiles complete the same Work Unit protocol fixture."
@@ -275,8 +282,10 @@ Phase One has exactly two runner implementations of
    (Task 13), used to drive the five-Episode reference scenario in
    `e2e_phase_one.rs`.
 
-I checked whether any existing test runs the *same* fixture or scenario
-through both and asserts equivalent outcomes:
+### 8.1 Task 14's original finding (honest unmet criterion)
+
+At the time Task 14 ran this gate, I checked whether any existing test runs
+the *same* fixture or scenario through both and asserts equivalent outcomes:
 
 - `crates/loopward-runner-command/tests/runner_contract.rs` exercises
   `CommandRunner` exclusively, against ad hoc scripted shell commands
@@ -293,16 +302,60 @@ through both and asserts equivalent outcomes:
   relies on the CLI's `NullRunner`/default path), and in any case does not
   run the same fixture that `e2e_phase_one.rs` runs through `FakeRunner`.
 
-**Conclusion: this criterion is genuinely unmet.** No test in this
-workspace demonstrates two different runner profiles completing the same
-Work Unit protocol fixture with equivalent outcomes. This is not something
-this task fixes: doing so would mean writing new integration-test
-infrastructure (a shared fixture driven through both `CommandRunner` and
-`FakeRunner`, with an assertion of equivalent outcomes), which is new scope
-beyond Task 14's file list (`docs/README.md`,
-`docs/phase-one-conformance.md`, and `docs/schemas/*` only if a schema
-mismatch is found — none was). Recorded here as an honest gap for whoever
-picks up Phase Two or a Task 14 follow-up.
+**Conclusion at the time: this criterion was genuinely unmet.** No test in
+the workspace demonstrated two different runner profiles completing the
+same Work Unit protocol fixture with equivalent outcomes. Fixing it meant
+writing new integration-test infrastructure, which was new scope beyond
+Task 14's file list (`docs/README.md`, `docs/phase-one-conformance.md`, and
+`docs/schemas/*` only). It was recorded as an honest gap for a follow-up
+task.
+
+### 8.2 Task 15 addendum: the gap is now closed
+
+A new, narrowly-scoped test closes this gap without re-running the full
+five-Episode reference scenario (Task 13's scripted multi-Episode narrative
+of rejection and remediation) through a real external process — that would
+be disproportionate scope for what §13 actually asks for. Instead, one
+simple Work Unit protocol fixture (one `WorkUnitRequest` shape and one
+expected successful `WorkUnitResult` — `outcome: Produced`, carrying one
+deterministic output resource) is driven through both runner profiles:
+
+- `crates/loopward-cli/tests/runner_profile_parity.rs` (new file; this
+  crate already carries `loopward-runner-command` as a normal dependency
+  and `loopward-testkit` as a dev-dependency, so no `Cargo.toml` change was
+  needed).
+- `tests/fixtures/runner/parity.sh` (new file) is a small, portable POSIX
+  shell command, invoked through `CommandRunner` exactly the way
+  `runner_contract.rs`'s existing fixture scripts are (isolated attempt
+  directory, `LOOPWARD_RESULT_PATH`, etc.) — it writes a fixed,
+  hand-authored `result.json` declaring `outcome: "produced"` and one
+  output resource with a fixed `uri`/`digest`/`size`/`summary`.
+- The same output resource, byte-for-byte identical, is what
+  `loopward_testkit::FakeRunner` is scripted (via
+  `AttemptScript::succeeding_with`) to return for the same fixture request
+  shape.
+- The test's single assertion path (`two_different_runner_profiles_complete_the_same_work_unit_protocol_fixture`)
+  drives the fixture through both `CommandRunner` and `FakeRunner` and
+  asserts both collected results share the same protocol version, the same
+  runner-asserted `WorkUnitOutcome`, and the same declared output resource
+  content.
+
+Note on terminology: `WorkUnitOutcome` (`crates/loopward-api/src/work_unit.rs`)
+has exactly three variants — `Produced`, `Failed`, `Partial` — and
+deliberately excludes acceptance-pipeline states such as `Accepted`
+(`docs/06-verification-and-recovery.md` §2's own distinction: a runner
+result is a proposal, never Loopward's own later acceptance determination).
+"Equivalent successful outcome" for this gate therefore means both profiles
+report `WorkUnitOutcome::Produced` for the same fixture with equivalent
+output content — the full accept/verify pipeline is intentionally out of
+scope for a runner-profile-parity test, which operates below that gate.
+
+**Result: pass.** `cargo test -p loopward-cli --test runner_profile_parity`
+— 1 passed, 0 failed. Verified together with the rest of the workspace:
+`cargo test --workspace` — 205 passed, 0 failed, 1 ignored (the same
+pre-existing ignored `Doc-tests loopward_store_sqlite` doc test noted in
+§4.1); `cargo fmt --all --check` and
+`cargo clippy --workspace --all-targets -- -D warnings` both clean.
 
 ## 9. Schema parity
 
@@ -340,10 +393,14 @@ the runtime proven to run correctly with tracing disabled and without a
 telemetry backend. No Aether/orchestration concept appears anywhere in
 production code.
 
-Two items keep this report at DONE_WITH_CONCERNS rather than a clean pass:
+Two items kept this report at DONE_WITH_CONCERNS rather than a clean pass:
 `cargo doc --workspace --no-deps` succeeds but is not warning-free (18
 rustdoc diagnostics, pre-existing, never previously checked), and the
 runner-profile-parity acceptance criterion (§13's two-runner-profile
-requirement) has no supporting test anywhere in this workspace. Both are
+requirement) had no supporting test anywhere in this workspace. Both are
 recorded as genuine findings rather than silently resolved or worked
 around, per this task's mandate to report evidence honestly.
+
+**Task 15 addendum:** the runner-profile-parity item has since been closed
+— see §8.2. Only the `cargo doc` rustdoc-warnings item remains open; it is
+unrelated to this addendum and was out of scope for it.
