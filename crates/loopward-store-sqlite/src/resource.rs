@@ -157,6 +157,46 @@ impl FileResourceBroker {
         }
         Ok((hex_lower(&hasher.finalize()), size))
     }
+
+    /// Recovers `(digest, size)` for a pending resource whose bytes were
+    /// already published (its pending file is gone) but whose metadata swap
+    /// never committed — the crash window between the atomic rename and the
+    /// transaction at the end of [`Self::finalize`].
+    async fn recover_published_digest(
+        &self,
+        uri: &str,
+        pending_path: &Path,
+    ) -> Result<(String, u64), ResourceError> {
+        let row = sqlx::query("SELECT digest FROM resources WHERE resource_uri = ?1")
+            .bind(uri)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(SqliteStoreError::from)?;
+        let Some(row) = row else {
+            return Err(SqliteStoreError::resource_io(
+                pending_path,
+                std::io::Error::new(std::io::ErrorKind::NotFound, "pending buffer missing"),
+            )
+            .into());
+        };
+        let recorded: String = row.try_get(0).map_err(SqliteStoreError::from)?;
+        let digest = recorded
+            .strip_prefix("sha256:")
+            .ok_or_else(|| {
+                SqliteStoreError::resource_io(
+                    pending_path,
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "pending buffer vanished before its digest was recorded",
+                    ),
+                )
+            })?;
+        let content_path = self.content_path(digest);
+        let size = std::fs::metadata(&content_path)
+            .map_err(|source| SqliteStoreError::resource_io(&content_path, source))?
+            .len();
+        Ok((digest.to_owned(), size))
+    }
 }
 
 #[async_trait]
@@ -211,11 +251,31 @@ impl ResourceBroker for FileResourceBroker {
         // their own content address with one atomic rename. Identical
         // content renames onto an identical file, which is why replacing an
         // existing target is safe.
-        let (digest, size) = Self::digest_of(&pending_path).map_err(ResourceError::from)?;
-        let content_path = self.content_path(&digest);
-        std::fs::rename(&pending_path, &content_path)
-            .map_err(|source| SqliteStoreError::resource_io(&content_path, source))
-            .map_err(ResourceError::from)?;
+        let (digest, size) = if pending_path.exists() {
+            let (digest, size) = Self::digest_of(&pending_path).map_err(ResourceError::from)?;
+
+            // Record the digest before publishing the bytes: if the process
+            // crashes between the rename below and the metadata swap at the
+            // end of this method, this is what lets a retried `finalize` on
+            // the same handle recover — the bytes are gone from
+            // `pending_path` by then, so their digest can only be recovered
+            // from here.
+            sqlx::query("UPDATE resources SET digest = ?1 WHERE resource_uri = ?2")
+                .bind(format!("sha256:{digest}"))
+                .bind(handle.as_str())
+                .execute(&self.pool)
+                .await
+                .map_err(SqliteStoreError::from)?;
+
+            let content_path = self.content_path(&digest);
+            std::fs::rename(&pending_path, &content_path)
+                .map_err(|source| SqliteStoreError::resource_io(&content_path, source))
+                .map_err(ResourceError::from)?;
+            (digest, size)
+        } else {
+            self.recover_published_digest(handle.as_str(), &pending_path)
+                .await?
+        };
 
         let uri = format!("{CONTENT_PREFIX}{digest}");
         let hint = self
@@ -245,7 +305,7 @@ impl ResourceBroker for FileResourceBroker {
         .bind(format!("sha256:{digest}"))
         .bind(hint.media_type.clone())
         .bind(sql_i64("resource size", size).map_err(ResourceError::from)?)
-        .bind(content_path.display().to_string())
+        .bind(self.content_path(&digest).display().to_string())
         .bind(format_timestamp(Timestamp::now_utc()).map_err(ResourceError::from)?)
         .execute(&mut *transaction)
         .await
@@ -316,5 +376,79 @@ impl ResourceBroker for FileResourceBroker {
             return Err(ResourceError::UnresolvableReference(reference.uri.clone()));
         }
         Ok(bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use loopward_runtime::ports::ResourceBeginHint;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    async fn broker() -> (FileResourceBroker, tempfile::TempDir) {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let pool = SqlitePoolOptions::new()
+            .connect(&format!(
+                "sqlite://{}/loopward.db?mode=rwc",
+                directory.path().display()
+            ))
+            .await
+            .expect("pool opens");
+        crate::run_migrations(&pool).await.expect("migrations apply");
+        let broker = FileResourceBroker::new(pool, directory.path().join("resources"))
+            .expect("broker opens");
+        (broker, directory)
+    }
+
+    #[tokio::test]
+    async fn finalize_recovers_after_a_crash_between_rename_and_metadata_commit() {
+        let (broker, _directory) = broker().await;
+        let handle = broker
+            .begin(ResourceBeginHint {
+                media_type: Some("text/plain".to_owned()),
+                summary: None,
+            })
+            .await
+            .expect("begin succeeds");
+        broker
+            .write(&handle, b"hello crash window")
+            .await
+            .expect("write succeeds");
+
+        // Simulate exactly the crash window `finalize` must recover from:
+        // the bytes are already published under their content address (the
+        // atomic rename succeeded) but the metadata swap that would flip
+        // the row to `finalized = 1` never ran, so the row still names the
+        // pending URI.
+        let pending_id = handle
+            .as_str()
+            .strip_prefix(PENDING_PREFIX)
+            .expect("pending uri");
+        let pending_path = broker.pending_path(pending_id);
+        let (digest, _size) =
+            FileResourceBroker::digest_of(&pending_path).expect("digest computes");
+        sqlx::query("UPDATE resources SET digest = ?1 WHERE resource_uri = ?2")
+            .bind(format!("sha256:{digest}"))
+            .bind(handle.as_str())
+            .execute(&broker.pool)
+            .await
+            .expect("digest recorded");
+        let content_path = broker.content_path(&digest);
+        std::fs::rename(&pending_path, &content_path).expect("simulated publish");
+
+        let resolved = broker
+            .finalize(handle)
+            .await
+            .expect("finalize recovers from the crash window instead of erroring");
+        assert_eq!(
+            resolved.digest.as_deref(),
+            Some(format!("sha256:{digest}").as_str())
+        );
+
+        let bytes = broker
+            .resolve(&resolved)
+            .await
+            .expect("published content resolves");
+        assert_eq!(bytes, b"hello crash window");
     }
 }
