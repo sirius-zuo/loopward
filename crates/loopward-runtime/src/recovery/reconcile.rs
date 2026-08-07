@@ -464,21 +464,59 @@ impl RecoveryManager {
                     reason: SuspensionReason::Recovery,
                 })
             }
-            // `Failed`, `Cancelled`, `Unknown`, or the reconcile call itself
-            // failing: none of these can be safely distinguished from an
-            // unobservable external effect through this controller's
-            // current command surface (only `RequestRotation`'s
-            // runner-failure disposition reaches a documented `Ambiguous`
-            // edge from `Running`/`Prepared`), so all four take the
-            // conservative, already-reviewed mandatory-closure path a
-            // graceful in-process runner failure already uses. Known
-            // simplification: a *confirmed* `Failed`/`Cancelled` report is
-            // recorded as durably `Ambiguous` rather than a distinct
-            // terminal status Core has no command to produce from here.
-            Ok(
-                ReconcileOutcome::Failed | ReconcileOutcome::Cancelled | ReconcileOutcome::Unknown,
-            )
-            | Err(_) => {
+            Ok(ReconcileOutcome::Failed | ReconcileOutcome::Cancelled) => {
+                // Confirmed terminal: the external effect is over. Record
+                // the actual status *before* requesting rotation, so the
+                // reducer's `apply_rotation_requested` (whose `other =>
+                // other` arm preserves an already-terminal status) does not
+                // fall back to its conservative `Ambiguous` mapping for a
+                // pre-crash `Running`/`Prepared` attempt — that mapping
+                // exists for effects that genuinely cannot be observed,
+                // which this is not. `Failed`/`Cancelled` is not blocking
+                // for `require_reconciled_attempt`, so this self-heals on
+                // the next `recover()` the same way a dangling Attempt
+                // reconciled after Episode termination already does.
+                let confirmed_status = if matches!(reconciled, Ok(ReconcileOutcome::Cancelled)) {
+                    loopward_core::AttemptStatus::Cancelled
+                } else {
+                    loopward_core::AttemptStatus::Failed
+                };
+                let mut state = state;
+                if let Some(recorded) = state.attempt.as_mut()
+                    && recorded.id == attempt.id
+                {
+                    recorded.status = confirmed_status;
+                    recorded.result_ref = None;
+                }
+                let state = self
+                    .controller
+                    .apply(
+                        loop_id,
+                        lease,
+                        &state,
+                        LifecycleCommand::RequestRotation {
+                            reason: RotationReason::RunnerFailure,
+                        },
+                    )
+                    .await?;
+                self.controller
+                    .ensure_episode_terminal_and_commit(
+                        loop_id,
+                        lease,
+                        state,
+                        episode_id,
+                        SuspensionReason::Recovery,
+                    )
+                    .await?;
+                Ok(EpisodeRecoveryOutcome::Suspended {
+                    reason: SuspensionReason::Recovery,
+                })
+            }
+            // `Unknown`, or the reconcile call itself failing: neither
+            // confirms the external effect is over, so neither can be
+            // safely distinguished from an unobservable effect — this is
+            // the case the reducer's `Ambiguous` mapping exists for.
+            Ok(ReconcileOutcome::Unknown) | Err(_) => {
                 let state = self
                     .controller
                     .apply(

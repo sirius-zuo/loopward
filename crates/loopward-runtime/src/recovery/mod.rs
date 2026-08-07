@@ -281,7 +281,14 @@ impl RecoveryManager {
             state
                 .attempt
                 .as_ref()
-                .filter(|attempt| attempt.status == AttemptStatus::Ambiguous)
+                .filter(|attempt| {
+                    matches!(
+                        attempt.status,
+                        AttemptStatus::Ambiguous
+                            | AttemptStatus::Failed
+                            | AttemptStatus::Cancelled
+                    )
+                })
                 .cloned()
         });
         let work_unit_stuck = state

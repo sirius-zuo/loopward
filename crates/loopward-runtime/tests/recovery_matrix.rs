@@ -1985,10 +1985,10 @@ async fn in_episode_reconcile_suspended_preserves_the_runners_own_suspension() {
 }
 
 /// A confirmed runner failure (inside a live Episode) mandates closure:
-/// Core's only reachable terminal status from `Running` here is
-/// `Ambiguous`, and the Loop suspends. Per Important #3's fix, that
-/// `Ambiguous` Attempt is not a dead end: a later `resume` reconciles it
-/// too, asking the runner again before retiring it.
+/// the actual `Failed` status is recorded durably *before* requesting
+/// rotation, so the reducer's `apply_rotation_requested` preserves it
+/// instead of mapping it to `Ambiguous`. The Loop suspends, and a
+/// later `resume` reconciles the dangling attempt too.
 #[tokio::test]
 async fn in_episode_reconcile_failed_marks_ambiguous_and_a_later_resume_clears_it() {
     let (ports, _broker, ids, store) = build_ports();
@@ -2028,14 +2028,16 @@ async fn in_episode_reconcile_failed_marks_ambiguous_and_a_later_resume_clears_i
     assert_eq!(stored.state.execution.status, LoopStatus::Suspended);
     assert_eq!(
         stored.state.attempt.as_ref().map(|a| a.status),
-        Some(AttemptStatus::Ambiguous),
-        "Core's mechanical closure of a confirmed failure inside a live episode is Ambiguous"
+        Some(AttemptStatus::Failed),
+        "a confirmed runner failure is recorded durably as Failed, not Ambiguous"
     );
     assert!(stored.state.active_episode().is_none());
 
     // A later `resume` (through the service, not `RecoveryManager` directly)
-    // reconciles the now-`Ambiguous` Attempt exactly as it would a dangling
-    // `Suspended` one, once the runner gives a confirmed answer.
+    // reconciles the now-`Failed` Attempt via `reconcile_dangling_attempt`,
+    // which already trusts confirmed terminal outcomes. Once the runner
+    // gives a confirmed answer, the Attempt transitions and the Work Unit
+    // is unstuck to `Pending`.
     runner.set_reconcile_outcome(Ok(ReconcileOutcome::Cancelled));
     let service = RuntimeLoopService::new(built_controller);
     resume_loop(&service, loop_id).await;
@@ -2045,7 +2047,7 @@ async fn in_episode_reconcile_failed_marks_ambiguous_and_a_later_resume_clears_i
     assert_eq!(
         stored.state.attempt.as_ref().map(|a| a.status),
         Some(AttemptStatus::Cancelled),
-        "the Ambiguous Attempt must no longer be a dead end"
+        "the confirmed Failed Attempt is reconciled and cleared on resume"
     );
     assert_eq!(
         stored.state.work_unit.as_ref().map(|wu| wu.status),
@@ -2096,7 +2098,8 @@ async fn in_episode_reconcile_cancelled_marks_ambiguous_and_suspends() {
     let stored = ports.store.load(loop_id).await.expect("load succeeds");
     assert_eq!(
         stored.state.attempt.as_ref().map(|a| a.status),
-        Some(AttemptStatus::Ambiguous)
+        Some(AttemptStatus::Cancelled),
+        "a confirmed runner cancellation is recorded durably as Cancelled, not Ambiguous"
     );
 }
 
