@@ -96,7 +96,7 @@ use loopward_observability::spans::{
     Span, SpanContext, SpanLink, SpanLinkKind, SpanStart, span_name,
 };
 
-use crate::context::ContextCandidate;
+use crate::context::{ContextCandidate, resource_grants_for_manifest};
 use crate::ports::{
     AcquireLease, CheckpointCommitRequest, LoopLease, ResourceBeginHint, ResourceError,
     RuntimeInstanceId, RuntimePorts, StoreError,
@@ -967,7 +967,10 @@ impl LoopController {
             attempt_id,
             idempotency_key,
             boot_package: report.manifest.clone(),
-            resource_grants: Vec::new(),
+            resource_grants: resource_grants_for_manifest(
+                work_unit.id,
+                &report.manifest,
+            ),
             output_contract: work_unit.output_contract.clone(),
             budget: work_unit.budget,
             deadline: None,

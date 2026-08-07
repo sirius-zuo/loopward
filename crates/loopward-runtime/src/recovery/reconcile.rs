@@ -43,6 +43,7 @@ use loopward_core::{
 };
 
 use crate::HydrationRequest;
+use crate::context::resource_grants_for_manifest;
 use crate::controller::{ControllerError, OperationOutcome};
 use crate::ports::LoopLease;
 
@@ -609,6 +610,8 @@ impl RecoveryManager {
             .resolve(&attempt.boot_package_ref)
             .await?;
         let boot_package: BootPackageManifest = serde_json::from_slice(&manifest_bytes)?;
+        let resource_grants =
+            resource_grants_for_manifest(work_unit.id, &boot_package).into_iter().collect();
 
         let request = WorkUnitRequest {
             protocol_version: loopward_api::PROTOCOL_VERSION.to_owned(),
@@ -620,7 +623,7 @@ impl RecoveryManager {
             attempt_id: attempt.id,
             idempotency_key: attempt.idempotency_key.clone(),
             boot_package,
-            resource_grants: Vec::new(),
+            resource_grants,
             output_contract: work_unit.output_contract.clone(),
             budget: work_unit.budget,
             deadline: None,
