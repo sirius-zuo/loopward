@@ -922,6 +922,7 @@ fn apply_episode_started(
     kind: EpisodeKind,
     base_checkpoint_version: u64,
 ) {
+    state.execution.episode_count += 1;
     state.episode = Some(Episode {
         id: episode_id,
         loop_id: state.execution.id,

@@ -144,6 +144,13 @@ pub struct LoopExecution {
     pub active_episode: Option<EpisodeId>,
     /// The active Work Unit, of which there is at most one in Phase One.
     pub active_work_unit: Option<WorkUnitId>,
+    /// The number of Episodes this Loop has ever started. Increments in
+    /// [`evolve`] on every `episode.started` event
+    /// (`docs/07-session-rotation.md` §3), giving
+    /// [`AggregateState::active_episode`] a durable ordinal instead of only
+    /// an identity — the public API's `EpisodeRef::ordinal` is projected
+    /// from this.
+    pub episode_count: u32,
     /// The Loop's resource budget.
     pub budget: ResourceBudget,
 }

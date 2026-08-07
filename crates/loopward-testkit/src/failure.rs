@@ -321,6 +321,7 @@ impl FailureInjector {
                 checkpoint_version: 1,
                 active_episode: None,
                 active_work_unit: Some(work_unit.id),
+                episode_count: 0,
                 budget: ResourceBudget::default(),
             },
             episode: None,
