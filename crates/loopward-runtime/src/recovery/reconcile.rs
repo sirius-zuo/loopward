@@ -610,8 +610,9 @@ impl RecoveryManager {
             .resolve(&attempt.boot_package_ref)
             .await?;
         let boot_package: BootPackageManifest = serde_json::from_slice(&manifest_bytes)?;
-        let resource_grants =
-            resource_grants_for_manifest(work_unit.id, &boot_package).into_iter().collect();
+        let resource_grants = resource_grants_for_manifest(work_unit.id, &boot_package)
+            .into_iter()
+            .collect();
 
         let request = WorkUnitRequest {
             protocol_version: loopward_api::PROTOCOL_VERSION.to_owned(),
