@@ -171,11 +171,32 @@ Comparative evaluation uses the command runner rather than testkit fakes. It can
 - **Integration boundary:** Configured agent commands belong in command-runner profiles; external-system integration belongs in case-specific wrappers.
 - **Wrapper safeguards:** Execution lineage, nesting limits, inherited resource budgets, cancellation propagation, and cycle detection are wrapper or deployment-policy concerns where recursive composition is possible.
 - **Scope boundary:** No Aether, DAG, scheduler, agent registry, plugin marketplace, telemetry backend, dashboard, or Web UI belongs in Phase One.
-- **Specification status:** The CLI and testkit design is specified but implementation has not been assessed.
 
 ## Spec Deviations
 
-Implementation has not been assessed.
+### `docs/08-tracing-and-observability.md`'s `loopward.rotation.signals` addition falls outside this page's cited section range
+
+- **Expected:** N/A. This page's Specification Sources cite `docs/08-tracing-and-observability.md` sections 13–15 (Sampling and Reliability through Acceptance Criteria) only.
+- **Implemented:** N/A. Commit `c536760` added `loopward.rotation.signals` to section 6 (Required Attributes' conditional-attributes list), alongside `loopward.rotation.reason`; sections 13–15 themselves were not touched by that commit.
+- **Reason:** There is no deviation here to explain; this entry records the conclusion of the anchor-drift check this refresh required, so the question is closed with cited evidence rather than left implicit.
+- **Impact:** None. This page's `docs/08` citation and section range remain accurate as written; no Source Anchors change was needed for it. (The same commit's rationale for the attribute itself, and its interaction with observability's Required Attributes section, is recorded on [Observability](observability.md), whose citation does cover section 6.)
+- **Status:** resolved (recorded here only to close out this page's drift-review question; it was never an active deviation for this page's cited range).
+
+### No `release_lease` mechanism: `create` followed by a separate CLI invocation deterministically fails `lease_unavailable`
+
+- **Expected:** The Phase One CLI Surface (`docs/10-mvp-and-evaluation.md` section 11) documents `advance`, `run`, `suspend`, `resume`, and `cancel` as ordinary follow-up operator commands against a Loop a prior `loopward create` produced.
+- **Implemented:** `LoopStore` has no `release_lease` method in its trait or either implementation (`SqliteLoopStore`, the in-memory test doubles). Each `loopward` invocation is a separate process with its own freshly minted `RuntimeInstanceId`, and `create` holds its own genesis lease for the configured TTL (`DEFAULT_LEASE_SECONDS`, 60 seconds, unless `--lease-seconds`/`LOOPWARD_LEASE_SECONDS` is set shorter). A separate, immediately following `advance`/`run`/`suspend`/`resume`/`cancel` invocation deterministically fails `LoopwardErrorCode::LeaseUnavailable` until that lease naturally expires.
+- **Reason:** `docs/phase-one-conformance.md` section 10.1 records this as an accepted, deliberate Phase One scope boundary: closing it would need either a `release_lease` port method on `LoopStore` or a caller-supplied stable holder identity shared across invocations, both new scope not implemented in Phase One.
+- **Impact:** A shell-scripted sequence of separate `loopward` invocations — the natural way to drive this CLI — needs a short `--lease-seconds` or a wait between `create` and the next lease-acquiring command. Read-only commands (`status`, `events`) are unaffected. Exercised as expected behavior by `crates/loopward-cli/tests/cli_contract.rs`'s `advance_and_run_conflict_with_the_lease_create_still_holds`.
+- **Status:** active.
+
+### `RuntimeLoopService::create` never assigns a Work Unit, so `NullRunner` has no reachable call site through any CLI command
+
+- **Expected:** No PR or design doc records an expectation that `create` itself assigns a Work Unit; this entry documents an observed consequence for CLI operators rather than a promise the specification makes and the implementation breaks.
+- **Implemented:** `RuntimeLoopService::create`'s own doc comment records that Phase One's `create()` produces a Loop with `work_unit: None`, because no `LifecycleCommand` in `loopward-core` assigns one. `LoopController::advance` therefore always returns `ControllerError::NoWorkUnit` (mapped to `LoopwardErrorCode::InvalidRequest`) for a freshly created Loop, before any runner method is called. Consequently, `commands.rs`'s `NullRunner` fallback — constructed whenever no `--runner-profile`/`LOOPWARD_RUNNER_PROFILE` is configured — has no reachable call site through any command this CLI exposes today; every one of its methods returning `RunnerErrorCode::Unavailable` is currently dead on that path.
+- **Reason:** No PR or design doc records a rationale for leaving Work Unit assignment out of `create`; observed current state: `create`'s own doc comment attributes this to `loopward-core`'s `Checkpoint` being an identity-and-versioning view with no field yet for a durably attached Work Unit — a separate, already-tracked drift from earlier tasks, not something this fix round attempted to close.
+- **Impact:** The illustrated `loopward create` → `loopward advance`/`run` sequence, run against real storage without a pre-seeded Work Unit, always fails cleanly with `InvalidRequest` rather than actually driving execution. `crates/loopward-cli/tests/cli_contract.rs`'s `full_lifecycle_via_the_cli` and `advance_and_run_conflict_with_the_lease_create_still_holds` both assert this `NoWorkUnit`/`InvalidRequest` outcome as expected, not as a passing "real" advance. The five-Episode reference scenario in `e2e_phase_one.rs` avoids this gap by driving `RuntimeLoopService` directly against a pre-seeded Work Unit rather than through `create`.
+- **Status:** active.
 
 ## Source Anchors
 
@@ -189,10 +210,21 @@ Implementation has not been assessed.
 - `docs/10-mvp-and-evaluation.md` (sections 1–13: Objective through Phase One Acceptance Gates)
 - `docs/11-risks-and-open-questions.md` (sections 1.10–1.11, 2.3–2.4, 4, and 5: Composition Risks; Session Reuse; Extension; Acceptance Criteria; Decision Record)
 - `docs/superpowers/plans/2026-07-29-loopward-phase-one.md` (Global Constraints; File and Crate Map; Tasks 12–14)
+- `docs/phase-one-conformance.md` (section 10: Known Phase One limitations — no release_lease mechanism; RetryPolicy read by no code)
 
 ### Implementation Sources
 
-Implementation has not been assessed.
+- `crates/loopward-cli/src/commands.rs` (module: commands — the Command subcommand enum and run dispatcher; SystemClock, UuidIdGenerator, DefaultVerificationPlanResolver, and NullRunner)
+- `crates/loopward-cli/src/config.rs` (module: config — ConfigArgs and its resolved Config)
+- `crates/loopward-cli/src/main.rs` (module: main — the loopward binary's composition-root entry point)
+- `crates/loopward-cli/tests/cli_contract.rs` (referenced not owned: binary-level contract tests driven through the compiled loopward process via assert_cmd)
+- `crates/loopward-cli/tests/e2e_phase_one.rs` (referenced not owned: the five-Episode reference scenario, driven in-process against RuntimeLoopService)
+- `crates/loopward-cli/tests/runner_profile_parity.rs` (referenced not owned: two_different_runner_profiles_complete_the_same_work_unit_protocol_fixture)
+- `crates/loopward-testkit/src/lib.rs` (module: lib — re-exports FixedClock, SequentialIdGenerator, CrashFixture, CrashPoint, FailureInjector, AttemptScript, FakeRunner, and TraceRecorder)
+- `crates/loopward-testkit/src/clock.rs` (module: clock — FixedClock, SequentialIdGenerator)
+- `crates/loopward-testkit/src/failure.rs` (module: failure — CrashPoint, CrashFixture, FailureInjector)
+- `crates/loopward-testkit/src/fake_runner.rs` (module: fake_runner — FakeRunner, AttemptScript)
+- `crates/loopward-testkit/src/trace_recorder.rs` (module: trace_recorder — TraceRecorder)
 
 ## Related Pages
 

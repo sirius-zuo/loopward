@@ -150,7 +150,15 @@ The error surface uses stable `LoopwardErrorCode` values with a sanitized messag
 
 ## Spec Deviations
 
-Implementation has not been assessed.
+### `RetryPolicy` is declared but not read by any Phase One runtime code
+
+- **Expected:** `docs/02-core-domain-model.md` and `docs/05-work-unit-and-runner-protocol.md` specify `retry_policy` as part of the `WorkUnit` contract, and `docs/schemas/work-unit-v0.1.yaml` declares its `retryable_codes` and `require_reconciliation_before_retry` fields as part of the durable wire schema.
+- **Implemented:** `RetryPolicy` (`crates/loopward-api/src/work_unit.rs`) is a real, serializable field on `WorkUnit` and round-trips through `contract_roundtrip.rs`, but no code in `loopward-core` or `loopward-runtime` reads `WorkUnit::retry_policy` to classify a failed Attempt as retryable or to require `reconcile` before a retry.
+- **Reason:** PR #2 body, "Notable decisions and known limitations": "`RetryPolicy` is declared in the wire contract but not read by any production code — an explicit, accepted Phase One scope deviation, also recorded in the conformance report." Confirmed in `docs/phase-one-conformance.md` §10.2, which states no reducer, policy, or rotation decision inspects the field.
+- **Impact:** A caller-authored `RetryPolicy` has no behavioral effect in Phase One; retryable-error classification and reconciliation-before-retry gating are unenforced until a later phase implements retry-policy enforcement.
+- **Status:** active (explicitly accepted Phase One scope limitation).
+
+No other material deviations were found between this page's prose and `crates/loopward-api`: the `LoopService` trait's nine operations, `WorkUnitRunner`'s eight operations, `CommandMetadata`, `CreateLoopRequest`, `RunUntilCommand`/`RunLimits`, `LoopStatusView`, `WorkUnitRequest`, `WorkUnitResult`, and `LoopwardErrorCode` all match the shapes and constraints described above; see Implementation Sources.
 
 ## Source Anchors
 
@@ -170,7 +178,18 @@ Implementation has not been assessed.
 
 ### Implementation Sources
 
-Implementation has not been assessed.
+- `crates/loopward-api/src/lib.rs` (crate root: PROTOCOL_VERSION, module declarations, and the crate's public re-exports)
+- `crates/loopward-api/src/loop_service.rs` (module: the LoopService trait, CommandMetadata, CreateLoopRequest, RunUntilCommand, RunLimits, LoopStatusView, OperationHandle, LoopResult)
+- `crates/loopward-api/src/runner.rs` (module: the WorkUnitRunner trait, RunnerCapabilities, RunHandle, RunStatus, ReconcileOutcome, RunnerError)
+- `crates/loopward-api/src/work_unit.rs` (module: WorkUnit, WorkUnitRequest, WorkUnitResult, WorkUnitOutcome, RetryPolicy)
+- `crates/loopward-api/src/event.rs` (module: LoopEvent, EventQuery, EventPage, EventCursor, EventDurability)
+- `crates/loopward-api/src/error.rs` (module: LoopwardError, LoopwardErrorCode)
+- `crates/loopward-api/src/ids.rs` (module: LoopId, EpisodeId, SessionId, WorkUnitId, AttemptId, OperationId, EventId, CheckpointId)
+- `crates/loopward-api/src/resource.rs` (module: ResourceRef, OpaqueRef, PhaseRef, SchemaRef, RunnerRef, OutputContract, VerificationPlanRef)
+- `crates/loopward-api/src/context.rs` (module: BootPackageManifest, ContextCapabilities, ResourceGrant, HandoffProposal, and the proposal DTOs carried in WorkUnitResult)
+- `crates/loopward-api/src/trace.rs` (module: TraceContext, TraceRef, TraceCoordinationLevel)
+- `crates/loopward-api/tests/contract_roundtrip.rs` (test: wire-format serialization round trips pinning every contract DTO's shape)
+- `crates/loopward-api/tests/workspace_smoke.rs` (test: asserts the crate's PROTOCOL_VERSION matches the Phase One protocol)
 
 ## Related Pages
 

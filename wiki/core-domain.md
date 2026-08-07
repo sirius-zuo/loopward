@@ -177,7 +177,15 @@ The domain transition interface consists of pure synchronous `decide` and `evolv
 
 ## Spec Deviations
 
-Implementation has not been assessed.
+### `LoopExecution.episode_count` was added to make `EpisodeRef.ordinal` real, not hardcoded
+
+- **Expected:** `docs/02-core-domain-model.md` (section 2: LoopExecution) lists `LoopExecution`'s fields as `id`, `kind`, `status`, `phase`, `aggregate_revision`, `checkpoint_version`, `active_episode`, `active_work_unit`, and `budget`; it does not show an episode counter. Separately, `docs/09-public-api.md` (section 6: Status View) requires `LoopStatusView::active_episode` to carry a lightweight `EpisodeRef` but does not define `EpisodeRef`'s fields or how its ordinal is derived.
+- **Implemented:** Before PR #3, `crates/loopward-runtime/src/controller/service.rs`'s `project_status` hardcoded `EpisodeRef::ordinal` to `0` for every Loop, with a comment stating a running counter was "future work." PR #3 (commit c536760, "fix(core): track a durable episode_count so EpisodeRef.ordinal is real") added `episode_count: u32` to `LoopExecution` (`crates/loopward-core/src/model.rs`), increments it in `reducer::apply_episode_started` on every `episode.started` event, and `project_status` now projects `EpisodeRef::ordinal` from `state.execution.episode_count`.
+- **Reason:** PR #3 body, commit list item 6: "adds `episode_count: u32` to `LoopExecution` and projects it in the public API." No design doc discusses an episode counter field; this closes a gap the domain model's illustrative struct never populated and the public API never specified a derivation for.
+- **Impact:** This is a spec-converging bug fix, not a deviation from documented behavior: nothing in `docs/02-core-domain-model.md` or `docs/09-public-api.md` mandated `ordinal` stay `0`, and the pre-fix state was an acknowledged stub rather than a documented design choice. `LoopExecution` now carries one field (`episode_count`) beyond the domain model doc's illustrative code block; since that block is a principal-entity overview rather than a frozen schema and the addition contradicts no stated invariant, this is not counted as a Core deviation, but the doc's struct listing is no longer a byte-exact match to `model.rs` and future readers should treat it as illustrative, not exhaustive.
+- **Status:** resolved.
+
+No other material deviations were found. `crates/loopward-core`'s dependency graph, module layout, and `decide`/`evolve`/`validate_invariants` signatures match the "pure, synchronous, I/O-free" Key Decision: `crates/loopward-core/Cargo.toml` depends only on `loopward-api`, `serde`, and `thiserror` — no Tokio, SQLite, OpenTelemetry, or vendor SDK — and no module imports `tokio`, `std::fs`, `std::net`, or `std::io`, nor declares an `async fn`. `decide` and `evolve` remain synchronous free functions in `reducer.rs`, matching `docs/02-core-domain-model.md` (section 12: Pure Transition Interface). The `LoopExecution`/`Episode`/`RuntimeSession`/`WorkUnit`/`WorkUnitAttempt`/`Checkpoint` class diagram in Architecture above still matches `model.rs`, aside from the `episode_count` addition documented above.
 
 ## Source Anchors
 
@@ -191,7 +199,15 @@ Implementation has not been assessed.
 
 ### Implementation Sources
 
-Implementation has not been assessed.
+- `crates/loopward-core/src/lib.rs` (crate root: module declarations, re-exports of decide, evolve, validate_invariants, and the pure-core invariants documented in the crate-level doc comment)
+- `crates/loopward-core/src/model.rs` (module: LoopExecution including episode_count, Episode, RuntimeSession, WorkUnitAttempt, Checkpoint, AggregateState, and their status enums)
+- `crates/loopward-core/src/command.rs` (module: LifecycleCommand, the input to decide)
+- `crates/loopward-core/src/event.rs` (module: LoopEvent, SessionCloseOutcome, RotationDisposition, the output of decide and input to evolve)
+- `crates/loopward-core/src/reducer.rs` (module: decide and evolve, plus the apply_* helpers including apply_episode_started which increments episode_count)
+- `crates/loopward-core/src/invariants.rs` (module: DomainError, Entity, and validate_invariants)
+- `crates/loopward-core/src/policy.rs` (module: EffectivePolicy, SessionReusePolicy, the third input to decide)
+- `crates/loopward-core/tests/lifecycle_contract.rs` (test: contract tests exercising every invariant listed under Implementation Notes through StateBuilder-constructed states, decide/evolve/validate_invariants, with no mocks or I/O)
+- `crates/loopward-api/src/loop_service.rs` (module, referenced not owned: EpisodeRef, whose ordinal field project_status now populates from LoopExecution::episode_count)
 
 ## Related Pages
 

@@ -143,11 +143,24 @@ Events, metrics, and logs are complementary views of lifecycle telemetry. Signif
 - **Sampling:** External policies should preserve errors, ambiguity, suspension, recovery, and rotation anomalies when supported.
 - **Testing:** Phase One uses an in-memory span exporter or recorder, deterministic clocks and identifiers, assertions on names, attributes, links, and redaction, plus failure injection around runner, verification, and Checkpoint operations.
 - **Evaluation:** Trace continuity is measured as Episodes correctly linked through Checkpoints; unavailable telemetry remains unavailable rather than estimated without attribution.
-- **Specification status:** The observability documents are drafts for review; implementation has not been assessed.
 
 ## Spec Deviations
 
-Implementation has not been assessed.
+### `loopward.rotation.signals` was a synchronized feature addition, not a pre-existing deviation
+
+- **Expected:** N/A. Before commit c536760, `docs/08-tracing-and-observability.md` (section 6: Required Attributes) did not list `loopward.rotation.signals` among the conditional attributes; only `loopward.rotation.reason` was documented there.
+- **Implemented:** N/A. Before c536760 (i.e. as PR #2 landed it), `loopward-observability`'s `attribute` module had no `ROTATION_SIGNALS` constant, and the admission-decision code in `loopward-runtime`'s `LoopController` (module `controller::advance`) recorded only `ROTATION_REASON`, the primary reason, on the Episode span — it never recorded the full ordered list of applicable rotation signals. Commit c536760 added the `ROTATION_SIGNALS` constant, the corresponding doc line, and the `controller::advance` code that calls a new `rotation_signals_label` helper to set it, all together — so the spec and the implementation moved from "neither names this attribute" to "both do" within one commit. There was never a window where one side promised or carried this attribute and the other did not.
+- **Reason:** PR #3's body, commit list item 10, states the fix directly: "feat(observability): record every rotation signal, not just the primary reason — adds `loopward.rotation.signals` span attribute."
+- **Impact:** None. No deployment or dashboard reading `docs/08`'s documented conditional-attribute list before c536760 could have observed a gap here, because the attribute existed in neither the spec nor the implementation until this commit introduced both.
+- **Status:** resolved (recorded here only to close out this page's drift-review question with cited evidence; it was never an active deviation).
+
+### `loopward.episode.ordinal` is a required span attribute that is never set
+
+- **Expected:** `docs/08-tracing-and-observability.md` (section 6: Required Attributes) lists `loopward.episode.ordinal` as one of the thirteen attributes lifecycle spans include when applicable, alongside `loopward.loop.id`, `loopward.episode.id`, and `loopward.checkpoint.version`.
+- **Implemented:** `EPISODE_ORDINAL` is defined in `loopward-observability`'s `attribute` module and is exercised by two of `semantic_conventions.rs`'s tests, but only as a namespacing and forbidden-substring check — no test asserts it is ever attached to a real span, and a workspace-wide grep for `EPISODE_ORDINAL` finds no call site outside `attributes.rs` and that one test file. The Episode span itself, built by `open_episode_span` in `loopward-runtime`'s `controller::advance` module, sets `LOOP_ID`, `EPISODE_ID`, and `CHECKPOINT_VERSION` on its `SpanStart`, but never `EPISODE_ORDINAL`.
+- **Reason:** No PR or design doc records a rationale; observed current state: PR #3's fix "track a durable episode_count so EpisodeRef.ordinal is real" (commit list item 6) added an `episode_count` field to `loopward-core`'s `LoopExecution` and wired it into the public API's `EpisodeRef.ordinal` (projected by `project_status` in `loopward-runtime`'s `controller::service` module), closing the equivalent gap for the public API projection — but that same fix round did not extend the now-durable episode count into the `loopward.episode` span's attributes.
+- **Impact:** Every `loopward.episode` span is missing a required attribute per `docs/08` section 6. A backend or dashboard that wants to group or filter traces by an Episode's ordinal position within its Loop cannot do so from span data alone and must fall back to the public API's `EpisodeRef.ordinal` (correct as of PR #3) or to trace-linkage order via `continuation_of` links instead.
+- **Status:** active.
 
 ## Source Anchors
 
@@ -161,7 +174,16 @@ Implementation has not been assessed.
 
 ### Implementation Sources
 
-Implementation has not been assessed.
+- `crates/loopward-observability/src/attributes.rs` (module: attribute — LOOP_ID through VERIFICATION_OUTCOME, including ROTATION_SIGNALS and EPISODE_ORDINAL; FORBIDDEN_ATTRIBUTE_SUBSTRINGS)
+- `crates/loopward-observability/src/spans.rs` (module: span_name; SpanContext, SpanHandle, SpanLinkKind, SpanLink, SpanStatus, SpanStart, SpanEnd, and the Span RAII guard)
+- `crates/loopward-observability/src/events.rs` (module: event_name — the stable diagnostic event names §9 assigns)
+- `crates/loopward-observability/src/recorder.rs` (module: RecordedSpan and RecordingSink, the in-memory TelemetrySink this crate tests its own contract against)
+- `crates/loopward-observability/src/lib.rs` (module: TelemetryEvent, the TelemetrySink trait, and NoopTelemetrySink)
+- `crates/loopward-observability/tests/semantic_conventions.rs` (referenced not owned: span-name, required-attribute, conditional-attribute, and redaction-boundary conformance tests)
+- `crates/loopward-observability-otel/src/exporter.rs` (module: OtelTelemetrySink, its new and from_env constructors, and the otel_span_context, loopward_span_context, and otel_link translation helpers)
+- `crates/loopward-observability-otel/src/propagation.rs` (module: to_wire_trace_context and from_wire_trace_context, the W3C Trace Context translation this crate owns)
+- `crates/loopward-observability-otel/src/lib.rs` (module: re-exports OtelTelemetrySink)
+- `crates/loopward-observability-otel/tests/episode_links.rs` (referenced not owned: two-Episode trace-linkage, redaction, and recovery_of-link conformance tests against a real OpenTelemetry in-memory exporter)
 
 ## Related Pages
 
