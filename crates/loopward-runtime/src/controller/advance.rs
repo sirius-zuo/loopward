@@ -898,6 +898,12 @@ impl LoopController {
             hard_context_budget,
             ..RotationContext::default()
         });
+        if !admission_decision.signals.is_empty() {
+            episode_span.set_end_attribute(
+                attribute::ROTATION_SIGNALS,
+                rotation_signals_label(&admission_decision.signals),
+            );
+        }
 
         if admission_decision.primary_reason == Some(RotationReason::HardContextBudget) {
             // The hard context budget stops admission before any model work
@@ -1760,4 +1766,22 @@ impl LoopController {
         let checkpoint = self.build_checkpoint(&state, episode_id);
         self.commit(loop_id, lease, &state, checkpoint, None).await
     }
+}
+
+/// A stable, comma-joined rendering of every signal a [`RotationDecision`]
+/// carried, highest-precedence first — e.g. `"work_unit_boundary(mandatory),soft_context_budget"`
+/// — for `attribute::ROTATION_SIGNALS`. Best-effort observability only, never
+/// parsed back into a `RotationReason` by anything durable.
+fn rotation_signals_label(signals: &[crate::rotation::RotationSignal]) -> String {
+    signals
+        .iter()
+        .map(|signal| {
+            if signal.mandatory {
+                format!("{}(mandatory)", signal.reason.label())
+            } else {
+                signal.reason.label().to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }

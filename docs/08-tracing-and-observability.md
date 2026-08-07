@@ -117,6 +117,7 @@ Conditional attributes include:
 
 ```text
 loopward.rotation.reason
+loopward.rotation.signals
 loopward.suspension.code
 loopward.failure.code
 loopward.recovery.outcome

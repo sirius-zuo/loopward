@@ -44,6 +44,10 @@ pub mod attribute {
 
     /// Why a rotation was requested, when this span represents one.
     pub const ROTATION_REASON: &str = "loopward.rotation.reason";
+    /// Every [`RotationSignal`] that applied to a rotation decision, highest
+    /// precedence first — not just the primary reason that was recorded on
+    /// the durable `RotationRequested` event.
+    pub const ROTATION_SIGNALS: &str = "loopward.rotation.signals";
     /// The stable suspension code, when this span represents a suspension.
     pub const SUSPENSION_CODE: &str = "loopward.suspension.code";
     /// The stable, sanitized failure code, when this span represents a
