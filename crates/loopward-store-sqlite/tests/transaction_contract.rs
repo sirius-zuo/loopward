@@ -924,28 +924,21 @@ async fn event_sequences_are_gap_free_across_committed_transactions() {
             loop_id,
             1,
             0,
-            vec![
-                LoopEvent::EpisodeStarted {
-                    episode_id: EpisodeId::new(),
-                    kind: EpisodeKind::Execution,
-                    base_checkpoint_version: 1,
-                },
-                LoopEvent::LoopCompleted,
-            ],
+            vec![LoopEvent::LoopCompleted],
         )
         .await
         .expect("append succeeds");
 
-    assert_eq!(harness.event_sequences(loop_id).await, vec![1, 2, 3]);
-    assert_eq!(stored.state.execution.aggregate_revision, 3);
+    assert_eq!(harness.event_sequences(loop_id).await, vec![1, 2]);
+    assert_eq!(stored.state.execution.aggregate_revision, 2);
     let revisions: Vec<u64> = stored
         .events
         .iter()
         .map(|event| event.aggregate_revision)
         .collect();
-    assert_eq!(revisions, vec![1, 2, 3]);
+    assert_eq!(revisions, vec![1, 2]);
     // Round-tripped domain facts survive serialization unchanged.
-    assert_eq!(stored.events[2].event, LoopEvent::LoopCompleted);
+    assert_eq!(stored.events[1].event, LoopEvent::LoopCompleted);
 }
 
 // ---------------------------------------------------------------------------

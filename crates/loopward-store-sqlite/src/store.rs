@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use loopward_api::ids::{LoopId, Timestamp};
-use loopward_core::{AggregateState, LoopEvent, evolve};
+use loopward_core::{AggregateState, LoopEvent, evolve, validate_invariants};
 use loopward_runtime::ports::{
     AcquireLease, CheckpointCommitRequest, LoopLease, LoopStore, StoreError, StoredLoop,
 };
@@ -233,6 +233,18 @@ impl SqliteLoopStore {
             )
             .await?;
         }
+
+        // Defense-in-depth: `write_projection_row` below is the only durable
+        // write `append` performs, and — unlike `commit_checkpoint`, whose
+        // callers (`LoopController::resume`/`cancel`,
+        // `RecoveryManager::commit_raw_projection`) already validate before
+        // writing — nothing upstream of here re-checks that folding these
+        // events left `state` internally consistent. A `decide`/`evolve`
+        // bug that produces an invariant-violating state must not be
+        // silently persisted just because no Checkpoint happened to commit
+        // while it was visible.
+        validate_invariants(&state)
+            .map_err(|source| SqliteStoreError::EventDidNotApply { loop_id, source })?;
 
         write_projection_row(connection, loop_id, &state).await?;
         load_stored(connection, loop_id)
