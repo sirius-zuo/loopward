@@ -156,7 +156,21 @@ A `RuntimeSession` is a replaceable execution generation within an Episode. `Ses
 
 ## Spec Deviations
 
-Implementation has not been assessed.
+### PR #3's "record every rotation signal" fix covers only the admission-time budget check, not the Work Unit boundary rotation path
+
+- **Expected:** `docs/07-session-rotation.md` (section 9: Rotation Record) specifies a `RotationRecord` with both `primary_reason: RotationReason` and `signals: Vec<RotationSignal>` — every contributing signal, not just the one chosen as primary. This page's own Architecture diagram mirrors that shape.
+- **Implemented:** `RotationPolicy::evaluate` (`crates/loopward-runtime/src/rotation/policy.rs`) always computes the full signal list as a `RotationDecision`. Before PR #3 (commit c536760), that `signals` list was computed at both call sites in `crates/loopward-runtime/src/controller/advance.rs` — the pre-Session admission check for soft/hard context budget, and the Work Unit boundary rotation decision — but discarded at both: only `primary_reason` reached `LoopController::commit`, which records a single `loopward.rotation.reason` span attribute and `rotation.requested` event. PR #3's "feat(observability): record every rotation signal, not just the primary reason" commit added a `loopward.rotation.signals` attribute (`crates/loopward-observability/src/attributes.rs`), but wired it into only the admission-time call site (the `if !admission_decision.signals.is_empty()` block before Session start). The Work Unit boundary call site still discards its `rotation_decision.signals` after computing it — an inline comment left in place at that call site states as much: "only the primary reason is durably recorded on this event today." Work Unit boundary rotation is the default rotation path (see this page's "Default to a fresh Runtime Session per Work Unit" Key Decision), so most rotations in Phase One still surface only a single reason in telemetry, and none surface the full signal list in durable state at all — `RuntimeSession.rotation_intent` (`crates/loopward-core/src/model.rs`) is typed `Option<RotationReason>`, one value, and is documented in place as "Phase One's in-projection form of the RotationRecord."
+- **Reason:** PR #3 body, commit list item 10, states only "adds `loopward.rotation.signals` span attribute" — it does not claim comprehensive coverage across every rotation call site, and no design doc discusses limiting the fix to the admission check. No PR or design doc records a rationale for why the Work Unit boundary path was left uncovered; observed current state is as described above.
+- **Impact:** The fix is a real, working partial closure of the gap it names — soft/hard budget signals riding alongside each other at Session admission time are now visible in telemetry — but it does not deliver "every rotation signal" for the common case. An operator inspecting traces for the majority of rotations (Work Unit boundary, with or without a concurrent soft-budget signal) still sees only `loopward.rotation.reason`, never `loopward.rotation.signals`, even though `RotationPolicy::evaluate` computed the fuller answer moments earlier.
+- **Status:** active.
+
+### `RotationRecord` from the specification has no persisted implementation; only its primary reason is durably recorded
+
+- **Expected:** `docs/07-session-rotation.md` (section 9: Rotation Record) defines `RotationRecord` as a durable structure carrying `loop_id`, `episode_id`, `from_session_id`, `from_generation`, `to_generation`, `primary_reason`, `signals`, `checkpoint_ref`, `prior_manifest_ref`, `next_budget`, `trace_links`, and `created_at`.
+- **Implemented:** No `RotationRecord` type exists anywhere in the workspace. `crates/loopward-core/src/model.rs` persists only `RuntimeSession.rotation_intent: Option<RotationReason>` — set once, in `reducer.rs`'s rotation-request handling, to the chosen primary reason. None of `signals`, `checkpoint_ref`, `prior_manifest_ref`, `next_budget`, or `trace_links` are captured as durable fields anywhere; `checkpoint_ref` and reason are reconstructable after the fact from the committed Checkpoint and the `rotation.requested` telemetry event, but the record itself is never assembled as a value.
+- **Reason:** No PR or design doc records a rationale; observed current state: `model.rs`'s own doc comment on `rotation_intent` names it as "Phase One's in-projection form of the RotationRecord," acknowledging the reduction from the specification's full structure to a single optional enum field without further explanation.
+- **Impact:** This page's Architecture diagram class `RotationRecord` (with a `signals` field) depicts the specification's shape, not a type instantiated anywhere in `loopward-runtime` or `loopward-core`. Anyone reconciling `docs/07-session-rotation.md` §9 against the code should read it as an as-designed target this page's Architecture section illustrates, not as a currently-persisted structure; the durably recorded projection is strictly narrower.
+- **Status:** active.
 
 ## Source Anchors
 
@@ -169,7 +183,21 @@ Implementation has not been assessed.
 
 ### Implementation Sources
 
-Implementation has not been assessed.
+- `crates/loopward-runtime/src/lib.rs` (crate root: forbids unsafe code, declares controller, ports, rotation, context, recovery, and verification modules, re-exports LoopController, RuntimeLoopService, RuntimePorts, and the rotation types)
+- `crates/loopward-runtime/src/controller/mod.rs` (module: re-exports advance and service)
+- `crates/loopward-runtime/src/controller/advance.rs` (module: LoopController with advance, run_until, commit, rotate_and_commit, and the per-Episode-kind step methods; rotation_signals_label)
+- `crates/loopward-runtime/src/controller/service.rs` (module: RuntimeLoopService, the adapter from LoopController to the public LoopService contract)
+- `crates/loopward-runtime/src/ports/mod.rs` (module: RuntimePorts, the bundle of trait-object ports one running driver composes)
+- `crates/loopward-runtime/src/ports/clock.rs` (module: Clock)
+- `crates/loopward-runtime/src/ports/id_generator.rs` (module: IdGenerator)
+- `crates/loopward-runtime/src/ports/resource.rs` (module: ResourceBroker, ResourceHandle, ResourceBeginHint, ResourceError)
+- `crates/loopward-runtime/src/ports/store.rs` (module: LoopStore, AcquireLease, LoopLease, StoreError, CheckpointCommitRequest, RecordedEvent, StoredLoop, RuntimeInstanceId)
+- `crates/loopward-runtime/src/rotation/mod.rs` (module: re-exports RotationContext, RotationDecision, RotationPolicy, RotationSignal)
+- `crates/loopward-runtime/src/rotation/policy.rs` (module: RotationPolicy::evaluate, RotationContext, RotationDecision, RotationSignal, and the PRECEDENCE table that resolves which RotationReason is primary when several signals apply at once)
+- `crates/loopward-core/src/model.rs` (referenced not owned: RuntimeSession.rotation_intent, the single-reason durable projection of the specification's RotationRecord)
+- `crates/loopward-observability/src/attributes.rs` (referenced not owned: the loopward.rotation.reason and loopward.rotation.signals span attribute constants)
+- `crates/loopward-runtime/tests/advance_episode.rs` (test: LoopController advance/run_until behavior including session-generation rotation, soft/hard budget admission, drain and pinned-integrity failures, and RuntimeLoopService integration)
+- `crates/loopward-runtime/tests/port_contract.rs` (test: RuntimePorts contract exercised through deterministic fakes — lease fencing, stale-revision rejection, checkpoint commit semantics)
 
 ## Related Pages
 
