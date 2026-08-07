@@ -390,6 +390,7 @@ impl RecoveryManager {
     /// account of it, per `docs/06-verification-and-recovery.md` §13 and the
     /// brief's `ReconcileOutcome` mapping. Never assumes the external effect
     /// failed merely because Loopward did not record its result.
+    #[allow(clippy::too_many_lines)]
     async fn reconcile_execution_attempt(
         &self,
         loop_id: loopward_api::ids::LoopId,
