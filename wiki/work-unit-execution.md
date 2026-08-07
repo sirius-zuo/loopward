@@ -228,7 +228,21 @@ The `ResourceBroker` stages runner output and returns a `ResourceRef` only after
 
 ## Spec Deviations
 
-Implementation has not been assessed.
+### PR #3's "record confirmed runner failure/cancellation, not Ambiguous" fix closed a gap in the section 10 reconciliation mapping
+
+- **Expected:** `docs/05-work-unit-and-runner-protocol.md` (section 10: Reconciliation) treats `Failed` and `Cancelled` as distinct confirmed `ReconcileOutcome` variants from `Unknown`; only `Unknown` is documented as becoming `Ambiguous` when safe repetition cannot be established. `loopward-core`'s `AttemptStatus` (`crates/loopward-core/src/model.rs`) likewise carries `Failed`, `Cancelled`, and `Ambiguous` as three separate terminal Attempt states.
+- **Implemented:** Before PR #3, `RecoveryManager`'s reconciliation handling (`crates/loopward-runtime/src/recovery/reconcile.rs`) matched `ReconcileOutcome::Failed`, `ReconcileOutcome::Cancelled`, `ReconcileOutcome::Unknown`, and a failing `reconcile` call all to the same conservative path, which recorded the Attempt as `Ambiguous` regardless of whether the runner had actually confirmed termination or failure. PR #3 split this: a confirmed `Failed` or `Cancelled` outcome now sets the Attempt's `AttemptStatus` to the matching confirmed value before requesting rotation, so the reducer's `apply_rotation_requested` preserves that already-terminal status instead of falling back to its `Ambiguous` mapping; only `Unknown` and a failed `reconcile` call still take the `Ambiguous`/suspend path.
+- **Reason:** PR #3's body, commit list item 2, states the fix directly: "`Failed`/`Cancelled` are recorded durably before `RequestRotation` so they survive the reducer's `apply_rotation_requested` instead of being mapped to `Ambiguous`." The pre-fix code's own comment (visible in the PR #3 diff) called this "a known simplification: a confirmed `Failed`/`Cancelled` report is recorded as durably `Ambiguous` rather than a distinct terminal status Core has no command to produce from here" — no design doc records why PR #2 shipped that simplification rather than the distinct-status handling `docs/05` describes.
+- **Impact:** Between PR #2 and PR #3, a runner that had unambiguously reported an Attempt as failed or cancelled during crash recovery was recorded as `Ambiguous` rather than `Failed`/`Cancelled`, which is the state `docs/05` section 10 reserves for outcomes recovery cannot actually confirm. This did not risk unsafe effect repetition (the pre-fix path was conservative, not permissive), but it collapsed a confirmed outcome into the same suspend-and-defer-to-policy handling as a genuinely unknown one. The fix restores the distinction for both `WorkUnitRunner::reconcile` results this page's Runtime Flow 4 describes.
+- **Status:** resolved.
+
+### PR #3's "recover finalize from the rename/commit crash window" fix closed a crash-recovery gap in `ResourceBroker.finalize`, which `CommandRunner::collect` depends on
+
+- **Expected:** `docs/05-work-unit-and-runner-protocol.md` (section 8: Resource Broker) states only finalized, digest-bound resources may be referenced by an accepted result, and section 9 (Intent Before External Effect) establishes the general principle that durable state must be recoverable across a crash rather than left in an unrecoverable partial state. `CommandRunner::collect` (`crates/loopward-runner-command/src/lib.rs`) depends on this: it calls `finalize_log`, which calls `ResourceBroker::finalize` on the captured stdout/stderr logs, and a `WorkUnitResult` cannot be produced until those finalize calls succeed.
+- **Implemented:** Before PR #3, `FileResourceBroker::finalize` (`crates/loopward-store-sqlite/src/resource.rs`, referenced not owned by this page) computed the content digest from the pending file, renamed it into place, and only afterward recorded the digest in the `resources` table within one transaction. A crash between the rename and that transaction left the bytes published under their content address but the row still naming the pending URI; a retried `finalize` on the same handle would then fail outright, since `Self::digest_of` could no longer find a pending file to hash. PR #3 added `recover_published_digest`, which persists the digest to the row before the rename, so a retried `finalize` after such a crash can recover the digest and size from the already-published content rather than failing.
+- **Reason:** PR #3's body, commit list item 1, states the fix directly: "persist digest before rename so a retried `finalize` on a crashed handle can recover." No design doc records why PR #2's original `finalize` left this window unrecoverable; the new regression test `finalize_recovers_after_a_crash_between_rename_and_metadata_commit` (`crates/loopward-store-sqlite/src/resource.rs`) exercises exactly this simulated crash window.
+- **Impact:** Between PR #2 and PR #3, a crash landing in this narrow window during `CommandRunner::collect`'s log finalization (or any other caller of `ResourceBroker::finalize`) would have made the affected Attempt's result permanently uncollectable through simple retry, since the pending file no longer existed for `finalize` to re-hash. The fix makes `finalize` idempotent across that crash window, which this page's Runtime Flow 2 ("the runner performs its internal work and writes output through `ResourceBroker`; only finalized resources receive digest-bound references") assumes but did not previously guarantee end-to-end.
+- **Status:** resolved.
 
 ## Source Anchors
 
@@ -245,7 +259,15 @@ Implementation has not been assessed.
 
 ### Implementation Sources
 
-Implementation has not been assessed.
+- `crates/loopward-runner-command/src/lib.rs` (module: CommandRunnerConfig, CommandRunner, its WorkUnitRunner implementation covering capabilities, start, reconcile, status, events, suspend, cancel, and collect, plus finalize_log and stream_file_into)
+- `crates/loopward-runner-command/src/process.rs` (module: TerminationObservation, CaptureReport, RunOutcome, RunEntry, RunRegistry, SpawnRequest, SpawnedRun, spawn, and the supervise task)
+- `crates/loopward-runner-command/src/protocol.rs` (module: AttemptLayout, the LOOPWARD_* and TRACEPARENT/TRACESTATE environment variable names, ProtocolVersion, ensure_compatible_version, and read_result)
+- `crates/loopward-runner-command/tests/runner_contract.rs` (referenced not owned: the protocol conformance suite exercising start, collect, cancel, capabilities, and reconcile against the documented contract)
+- `crates/loopward-api/src/work_unit.rs` (module: WorkUnitKind, WorkUnitStatus, AttemptBudget, ResourceBudget, RetryPolicy, WorkUnit, WorkUnitRequest, WorkUnitOutcome, UsageReport, WorkUnitResult)
+- `crates/loopward-api/src/runner.rs` (module: RunnerCapabilities, RunHandle, RunState, RunStatus, ReconcileOutcome, RunnerEvent, RunnerEventPage, SuspensionReason, CancellationReason, RunnerErrorCode, RunnerError, WorkUnitRunner)
+- `crates/loopward-core/src/model.rs` (referenced not owned: the durable WorkUnit and WorkUnitAttempt shapes and the AttemptStatus enum, including its Failed, Cancelled, and Ambiguous terminal variants)
+- `crates/loopward-runtime/src/recovery/reconcile.rs` (referenced not owned: RecoveryManager's handling of ReconcileOutcome, including the confirmed-Failed/Cancelled recording this page's Runtime Flow 4 depends on)
+- `crates/loopward-store-sqlite/src/resource.rs` (referenced not owned: FileResourceBroker's finalize and recover_published_digest, the ResourceBroker implementation CommandRunner::collect finalizes captured logs through)
 
 ## Related Pages
 
