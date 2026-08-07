@@ -390,6 +390,7 @@ impl RecoveryManager {
     /// account of it, per `docs/06-verification-and-recovery.md` §13 and the
     /// brief's `ReconcileOutcome` mapping. Never assumes the external effect
     /// failed merely because Loopward did not record its result.
+    #[allow(clippy::too_many_lines)]
     async fn reconcile_execution_attempt(
         &self,
         loop_id: loopward_api::ids::LoopId,
@@ -610,8 +611,9 @@ impl RecoveryManager {
             .resolve(&attempt.boot_package_ref)
             .await?;
         let boot_package: BootPackageManifest = serde_json::from_slice(&manifest_bytes)?;
-        let resource_grants =
-            resource_grants_for_manifest(work_unit.id, &boot_package).into_iter().collect();
+        let resource_grants = resource_grants_for_manifest(work_unit.id, &boot_package)
+            .into_iter()
+            .collect();
 
         let request = WorkUnitRequest {
             protocol_version: loopward_api::PROTOCOL_VERSION.to_owned(),

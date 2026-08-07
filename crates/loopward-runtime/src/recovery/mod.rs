@@ -284,9 +284,7 @@ impl RecoveryManager {
                 .filter(|attempt| {
                     matches!(
                         attempt.status,
-                        AttemptStatus::Ambiguous
-                            | AttemptStatus::Failed
-                            | AttemptStatus::Cancelled
+                        AttemptStatus::Ambiguous | AttemptStatus::Failed | AttemptStatus::Cancelled
                     )
                 })
                 .cloned()

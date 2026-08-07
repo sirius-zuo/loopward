@@ -973,10 +973,7 @@ impl LoopController {
             attempt_id,
             idempotency_key,
             boot_package: report.manifest.clone(),
-            resource_grants: resource_grants_for_manifest(
-                work_unit.id,
-                &report.manifest,
-            ),
+            resource_grants: resource_grants_for_manifest(work_unit.id, &report.manifest),
             output_contract: work_unit.output_contract.clone(),
             budget: work_unit.budget,
             deadline: None,

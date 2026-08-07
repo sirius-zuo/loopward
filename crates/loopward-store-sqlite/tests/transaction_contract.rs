@@ -921,12 +921,7 @@ async fn event_sequences_are_gap_free_across_committed_transactions() {
 
     let stored = harness
         .store
-        .append(
-            loop_id,
-            1,
-            0,
-            vec![LoopEvent::LoopCompleted],
-        )
+        .append(loop_id, 1, 0, vec![LoopEvent::LoopCompleted])
         .await
         .expect("append succeeds");
 

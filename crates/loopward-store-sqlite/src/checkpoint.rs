@@ -560,9 +560,7 @@ async fn write_resource_edges(
                 return Err(SqliteStoreError::UnknownResource { uri: uri.clone() });
             }
             Some(value) if *value != 1 => {
-                return Err(SqliteStoreError::ResourceNotFinalized {
-                    uri: uri.clone(),
-                });
+                return Err(SqliteStoreError::ResourceNotFinalized { uri: uri.clone() });
             }
             Some(_) => {}
         }
@@ -577,8 +575,7 @@ async fn write_resource_edges(
             .push_bind(uri.clone())
             .push_bind(*relation);
     });
-    insert
-        .push(" ON CONFLICT(loop_id, checkpoint_version, resource_uri, relation) DO NOTHING");
+    insert.push(" ON CONFLICT(loop_id, checkpoint_version, resource_uri, relation) DO NOTHING");
     insert.build().execute(&mut *connection).await?;
 
     Ok(())
