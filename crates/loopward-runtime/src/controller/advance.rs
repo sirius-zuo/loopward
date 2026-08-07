@@ -1,0 +1,1760 @@
+//! [`LoopController`]: the coordinator that advances one Loop by at most one
+//! durable Episode transition per call (`docs/07-session-rotation.md` §14).
+//!
+//! # The happy-path Episode sequence
+//!
+//! ```text
+//! acquire lease
+//! → load Checkpoint
+//! → start Episode
+//! → hydrate
+//! → create Session
+//! → persist Attempt intent
+//! → start runner
+//! → collect
+//! → drain
+//! → verify
+//! → commit Checkpoint
+//! → close Session and Episode
+//! ```
+//!
+//! Every external effect (hydration resolving resources, spawning the
+//! runner, verification resolving evidence) happens outside a database
+//! transaction: only [`decide`]/[`evolve`]'s resulting events ever cross into
+//! [`LoopStore::append`] or [`LoopStore::commit_checkpoint`].
+//!
+//! # Two Episodes per Work Unit, not one
+//!
+//! Reading the sequence above as *one* Episode is tempting but wrong for
+//! Phase One. `docs/07` §8's "fresh Runtime Session for verification"
+//! default cannot be satisfied within one Episode: [`EpisodeStatus`]'s
+//! documented edges (`docs/07` §3) let a Session start only while the
+//! Episode is `Hydrating`, and there is no edge from `Executing` back to
+//! `Hydrating` — only `Recovering` reaches `Hydrating` again, and that path
+//! is for crash recovery, not routine rotation. `docs/07` §6's own "Normal
+//! Rotation Sequence" confirms this: it ends with "Create next Episode and
+//! Session generation" and "Hydrate a new Boot Package". So a fresh
+//! verification Session is necessarily a fresh **Episode**, of
+//! [`EpisodeKind::Verification`] (already derived by
+//! `loopward_core::reducer::next_episode_kind` from the Work Unit's
+//! `awaiting_verification` status). [`LoopController::advance`] therefore
+//! runs the sequence above in two calls: one Execution Episode (hydrate
+//! through commit, ending with the Work Unit `awaiting_verification`), then
+//! one Verification Episode (hydrate a fresh Boot Package, start a fresh
+//! Session, verify, commit). Each call still performs at most one durable
+//! Episode transition, honoring `docs/07` §14 exactly.
+//!
+//! # A fixed gap in `LoopStore::append`
+//!
+//! Neither `loopward-store-sqlite`'s `SqliteLoopStore` nor
+//! `port_contract.rs`'s `InMemoryLoopStore` fake used to fold appended
+//! events into the projection fields (`episode`, `session`, `work_unit`,
+//! `attempt`) that `append` returns or persists — both only advanced
+//! `aggregate_revision` and round-tripped the rest of the projection
+//! unchanged. This was a real, currently-manifesting defect, not a
+//! future-only one: it silently broke [`LoopController::suspend`] on an idle
+//! Loop (the only durable write there is a bare `append` of `LoopSuspended`,
+//! which would leave the stored `execution.status` at `Active`), the
+//! `LifecycleCommand::Complete` branch of [`LoopController::advance`] (same shape —
+//! `LoopCompleted` appended but never reflected), and every early return
+//! from inside an Episode after `StartEpisode` but before the terminal
+//! commit (the next `advance()` call's `store.load()` would show no active
+//! Episode, so [`ControllerError::RecoveryRequired`] would never fire, and
+//! the controller would start a second Episode on top of the first one's
+//! orphaned journal entries).
+//!
+//! Both implementations now fold each event through `loopward_core::evolve`
+//! before persisting the projection — exactly mirroring what
+//! `commit_checkpoint` already does with its caller-supplied `state` — so
+//! `store.load()` is correct immediately after *any* durable write, not only
+//! after a Checkpoint commit. All three breakages above are fixed at the
+//! root: a plain `append` of `LoopSuspended`/`LoopCompleted` now correctly
+//! persists the new status, and an interrupted mid-Episode call now leaves a
+//! projection the next `advance()` call correctly recognizes as needing
+//! recovery.
+
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex};
+
+use loopward_api::context::{
+    BootPackageManifest, ContextBudget, ContextBudgetRequest, ContextClass, ContextPriority,
+};
+use loopward_api::ids::{EpisodeId, LoopId};
+use loopward_api::loop_service::{RunCondition, RunLimits};
+use loopward_api::resource::{OpaqueRef, ResourceRef, VerificationPlanRef};
+use loopward_api::runner::{RunnerError, SuspensionReason, WorkUnitRunner};
+use loopward_api::work_unit::{WorkUnit, WorkUnitRequest, WorkUnitResult};
+use loopward_core::{
+    AggregateState, Checkpoint, DomainError, EffectivePolicy, EpisodeKind, LifecycleCommand,
+    LoopEvent, LoopStatus, RotationReason, VerificationOutcome, decide, evolve,
+    validate_invariants, work_unit_status_is_terminal,
+};
+use loopward_observability::TelemetryEvent;
+use loopward_observability::attribute;
+use loopward_observability::event_name;
+use loopward_observability::spans::{
+    Span, SpanContext, SpanLink, SpanLinkKind, SpanStart, span_name,
+};
+
+use crate::context::ContextCandidate;
+use crate::ports::{
+    AcquireLease, CheckpointCommitRequest, LoopLease, ResourceBeginHint, ResourceError,
+    RuntimeInstanceId, RuntimePorts, StoreError,
+};
+use crate::rotation::{RotationContext, RotationPolicy};
+use crate::verification::{
+    AggregationPolicy, Digest, FindingLineage, RemediationPolicy, VerificationEngine,
+    VerificationError, VerificationGateSpec, VerificationPlan, VerificationPlanId,
+    VerificationRequest, VerificationTarget,
+};
+use crate::{HydrationError, HydrationReport, HydrationRequest};
+
+/// Supplies the Checkpoint Manager's projected context candidates for one
+/// Boot Package hydration.
+///
+/// No prior task builds a Checkpoint Manager that projects
+/// `docs/schemas/checkpoint-v0.1.yaml`'s `pinned`, `decisions.active`,
+/// `observations.verified`, and `resources` sections into
+/// [`ContextCandidate`]s (`loopward-runtime/src/context/hydrator.rs`'s own
+/// doc comment names this as the hydrator's expected input, supplied by a
+/// component this plan has not built yet). This is [`LoopController`]'s seam
+/// for one, mirroring [`VerificationPlanResolver`]: a deployment plugs in a
+/// real Checkpoint Manager here. The default
+/// [`LoopController::new`] configuration ([`DefaultContextCandidates`]) does
+/// not fabricate decisions, observations, or other Checkpoint-Manager-owned
+/// material it has no source for, but it does project the one piece of
+/// pinned state this controller already holds directly —
+/// [`WorkUnit::constraints`] — into required pinned candidates. Without
+/// that, the pinned-survives-hydration-and-drain integrity check (Global
+/// Constraints; see the drain-time re-hydration in
+/// [`Self::run_execution_episode`]) would be a permanent no-op in any real
+/// deployment that has not wired in its own provider, since an empty pinned
+/// set hashes to one constant digest that can never differ.
+pub trait ContextCandidateProvider: Send + Sync {
+    /// Returns the candidates to offer the hydrator for `work_unit`, judged
+    /// against `checkpoint`.
+    fn candidates(&self, work_unit: &WorkUnit, checkpoint: &Checkpoint) -> Vec<ContextCandidate>;
+}
+
+/// The default [`ContextCandidateProvider`]: projects each of
+/// [`WorkUnit::constraints`] into a required pinned candidate, and offers
+/// nothing else.
+///
+/// This keeps the pinned-digest integrity check live by default rather than
+/// only when a caller happens to inject a special provider, without
+/// fabricating decisions, observations, or other material only a real
+/// Checkpoint Manager can source.
+struct DefaultContextCandidates;
+
+impl ContextCandidateProvider for DefaultContextCandidates {
+    fn candidates(&self, work_unit: &WorkUnit, _checkpoint: &Checkpoint) -> Vec<ContextCandidate> {
+        work_unit
+            .constraints
+            .iter()
+            .enumerate()
+            .map(|(index, constraint)| ContextCandidate {
+                estimated_tokens: None,
+                selection_reason: format!(
+                    "declared work unit constraint `{}`",
+                    constraint.reference
+                ),
+                ..ContextCandidate::new(
+                    format!("work-unit-constraint-{index:04}"),
+                    "constraint",
+                    ResourceRef {
+                        uri: constraint.reference.clone(),
+                        media_type: None,
+                        digest: None,
+                        version: None,
+                        size: None,
+                        summary: None,
+                    },
+                    ContextClass::Pinned,
+                    ContextPriority::Required,
+                )
+            })
+            .collect()
+    }
+}
+
+/// Everything a [`VerificationPlan`] needs except the [`VerificationTarget`]
+/// it judges.
+///
+/// The target cannot be part of the template: it binds to the exact result
+/// a runner just collected (`docs/06-verification-and-recovery.md` §6),
+/// which does not exist until the Attempt has run. [`LoopController`] pairs
+/// this template with a freshly computed target to build the
+/// [`VerificationPlan`] it hands to the [`VerificationEngine`].
+#[derive(Debug, Clone)]
+pub struct VerificationPlanTemplate {
+    /// This plan's identity.
+    pub id: VerificationPlanId,
+    /// This plan's version. Part of the target binding.
+    pub version: u64,
+    /// The gates to evaluate.
+    pub gates: Vec<VerificationGateSpec>,
+    /// How findings fold into one outcome.
+    pub aggregation: AggregationPolicy,
+    /// The bounds remediation runs under.
+    pub remediation_policy: RemediationPolicy,
+}
+
+/// Resolves a Work Unit's [`VerificationPlanRef`] to the gates, aggregation,
+/// and remediation policy [`LoopController`] should evaluate against a
+/// collected result.
+///
+/// No prior task defines a durable plan registry, so this is
+/// [`LoopController`]'s own seam for one: a deployment-specific
+/// implementation (backed by configuration, a database, or a fixed table)
+/// plugs in here without `LoopController` needing to know how plans are
+/// stored.
+pub trait VerificationPlanResolver: Send + Sync {
+    /// Resolves `reference` to a plan template, or `None` if no plan is
+    /// registered for it.
+    fn resolve(&self, reference: &VerificationPlanRef) -> Option<VerificationPlanTemplate>;
+}
+
+/// The result of one [`LoopController::advance`] call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperationOutcome {
+    /// One Episode reached a safe terminal boundary and committed a
+    /// Checkpoint.
+    EpisodeCompleted {
+        /// The Episode that completed.
+        episode_id: EpisodeId,
+        /// The Checkpoint version it committed.
+        checkpoint_version: u64,
+        /// Whether this Episode started a new Work Unit Attempt (`true` for
+        /// a completed Execution Episode; `false` for a Verification
+        /// Episode, which never calls the runner). `LoopController::run_until`
+        /// uses this to enforce `ResourceCost::work_unit_attempts`, the one
+        /// resource-cost bound it can enforce without a resource-cost-
+        /// accounting port no prior task defines.
+        started_attempt: bool,
+    },
+    /// The Loop suspended before or during this call.
+    Suspended,
+    /// The Loop reached a terminal outcome (completed, failed, or
+    /// cancelled).
+    Terminal {
+        /// The terminal status reached.
+        status: LoopStatus,
+    },
+    /// Nothing was advanced: the Loop was already terminal or suspended, or
+    /// this call completed the Loop without running an Episode (no Work
+    /// Unit remained to attempt).
+    NoOp,
+}
+
+/// An error raised while advancing a Loop.
+#[derive(Debug, thiserror::Error)]
+pub enum ControllerError {
+    /// The durable store rejected an operation.
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    /// The reducer refused a command or rejected a resulting state.
+    #[error(transparent)]
+    Domain(#[from] DomainError),
+    /// Boot Package hydration failed.
+    #[error(transparent)]
+    Hydration(#[from] HydrationError),
+    /// Verification could not be run at all.
+    #[error(transparent)]
+    Verification(#[from] VerificationError),
+    /// The runner reported a protocol-level failure.
+    #[error("runner call failed: {0}")]
+    Runner(#[from] RunnerError),
+    /// A resource could not be written, finalized, or resolved.
+    #[error(transparent)]
+    Resource(#[from] ResourceError),
+    /// A durable artifact could not be serialized or deserialized.
+    #[error("could not (de)serialize a durable artifact: {0}")]
+    Serialization(#[from] serde_json::Error),
+    /// No [`VerificationPlanTemplate`] is registered for the Work Unit's
+    /// declared plan reference.
+    #[error("no verification plan is registered for `{0}`")]
+    UnknownVerificationPlan(String),
+    /// The Loop has no Work Unit assigned, so there is nothing to advance.
+    ///
+    /// Assigning a Work Unit to a Loop has no `LifecycleCommand`: Core
+    /// treats it as caller-supplied state (`docs/02-core-domain-model.md`
+    /// §11), and no earlier task defines how one gets there. Callers of
+    /// this controller are expected to have already placed a Work Unit in
+    /// the Loop's projection before calling `advance`.
+    #[error("loop {0} has no work unit assigned")]
+    NoWorkUnit(LoopId),
+    /// An Episode was already active when `advance` was called: a prior call
+    /// or process was interrupted mid-Episode.
+    ///
+    /// Reconciling and resuming an in-flight Episode is Task 10's concern
+    /// (Reconciliation and Crash Recovery); this controller only ever starts
+    /// and fully finishes one Episode per `advance` call, so it refuses
+    /// rather than guessing how to resume someone else's partial work.
+    #[error(
+        "loop {0} has an episode already in flight; recovery is required before it can advance"
+    )]
+    RecoveryRequired(LoopId),
+    /// `run_until` was called without any finite limit.
+    #[error("run_until requires at least one of max_episodes, deadline, or max_resource_cost")]
+    UnboundedRunUntil,
+    /// A structural invariant `LoopController` relies on, but does not
+    /// itself re-validate every branch of, did not hold.
+    #[error("internal invariant violated: {0}")]
+    Invariant(String),
+}
+
+/// The coordinator that advances one Loop by at most one durable Episode
+/// transition per [`Self::advance`] call.
+///
+/// See the module documentation for the exact sequence and for why one Work
+/// Unit takes two `advance` calls (an Execution Episode, then a Verification
+/// Episode) rather than one.
+#[derive(Clone)]
+pub struct LoopController {
+    ports: RuntimePorts,
+    hydrator: crate::ContextHydrator,
+    runner: Arc<dyn WorkUnitRunner>,
+    verification: VerificationEngine,
+    plans: Arc<dyn VerificationPlanResolver>,
+    candidates: Arc<dyn ContextCandidateProvider>,
+    policy: EffectivePolicy,
+    holder_id: RuntimeInstanceId,
+    context_rule_version: String,
+    default_budget: ContextBudget,
+    lease_ttl: time::Duration,
+    /// The most recently started Episode trace per Loop, used to link a new
+    /// Episode's root span to its predecessor's
+    /// (`docs/08-tracing-and-observability.md` §4, §7:
+    /// `continuation_of`). Best-effort and in-process only: tracing is not
+    /// the recovery path (§13), so losing this on a process restart only
+    /// loses a continuation *link*, never Loop progress or correctness.
+    trace_continuity: Arc<Mutex<HashMap<LoopId, SpanContext>>>,
+}
+
+impl std::fmt::Debug for LoopController {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoopController")
+            .field("holder_id", &self.holder_id)
+            .field("context_rule_version", &self.context_rule_version)
+            .finish_non_exhaustive()
+    }
+}
+
+impl LoopController {
+    /// Builds a controller over `ports`, executing Work Units through
+    /// `runner` and resolving verification plans through `plans`.
+    ///
+    /// Uses Phase One's default policy (fresh Runtime Session per Work Unit
+    /// and for verification), a conservative default context budget, and a
+    /// 60 second lease TTL; use the `with_*` builders to override them.
+    #[must_use]
+    pub fn new(
+        ports: RuntimePorts,
+        runner: Arc<dyn WorkUnitRunner>,
+        plans: Arc<dyn VerificationPlanResolver>,
+    ) -> Self {
+        let hydrator = crate::ContextHydrator::new(Arc::clone(&ports.resources));
+        Self {
+            ports,
+            hydrator,
+            runner,
+            verification: VerificationEngine::new(),
+            plans,
+            candidates: Arc::new(DefaultContextCandidates),
+            policy: EffectivePolicy::default(),
+            holder_id: RuntimeInstanceId::new(),
+            context_rule_version: "loopward.context-rules/v0.1".to_owned(),
+            default_budget: ContextBudget {
+                model_window_tokens: None,
+                soft_input_limit_tokens: 8_000,
+                hard_input_limit_tokens: 16_000,
+                reserved_output_tokens: 2_000,
+                reserved_tool_tokens: 1_000,
+                safety_margin_tokens: 500,
+            },
+            lease_ttl: time::Duration::seconds(60),
+            trace_continuity: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Overrides the effective policy (default: Phase One's fresh-session
+    /// deterministic policy).
+    #[must_use]
+    pub fn with_policy(mut self, policy: EffectivePolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// Overrides the recorded context selection rule version.
+    #[must_use]
+    pub fn with_context_rule_version(mut self, version: impl Into<String>) -> Self {
+        self.context_rule_version = version.into();
+        self
+    }
+
+    /// Overrides the default resolved context budget used when a Work Unit
+    /// does not request one.
+    #[must_use]
+    pub fn with_default_budget(mut self, budget: ContextBudget) -> Self {
+        self.default_budget = budget;
+        self
+    }
+
+    /// Overrides the lease TTL acquired for each `advance` call.
+    #[must_use]
+    pub fn with_lease_ttl(mut self, ttl: time::Duration) -> Self {
+        self.lease_ttl = ttl;
+        self
+    }
+
+    /// Overrides the verification engine (default: every Phase One gate
+    /// kind registered).
+    #[must_use]
+    pub fn with_verification_engine(mut self, engine: VerificationEngine) -> Self {
+        self.verification = engine;
+        self
+    }
+
+    /// Overrides the context candidate provider (default:
+    /// [`DefaultContextCandidates`], which projects
+    /// [`WorkUnit::constraints`] into required pinned candidates and offers
+    /// nothing else).
+    #[must_use]
+    pub fn with_candidate_provider(
+        mut self,
+        candidates: Arc<dyn ContextCandidateProvider>,
+    ) -> Self {
+        self.candidates = candidates;
+        self
+    }
+
+    /// The runtime ports this controller drives Loops with.
+    #[must_use]
+    pub fn ports(&self) -> &RuntimePorts {
+        &self.ports
+    }
+
+    /// The stable runtime instance identity this controller acquires leases
+    /// as.
+    #[must_use]
+    pub fn holder_id(&self) -> RuntimeInstanceId {
+        self.holder_id
+    }
+
+    /// The runner this controller invokes Work Unit Attempts through.
+    ///
+    /// `pub(crate)`: [`crate::recovery::RecoveryManager`] reconciles the same
+    /// runner's in-flight or ambiguous runs after a crash, and reuses this
+    /// controller's configuration rather than requiring its own copy.
+    #[must_use]
+    pub(crate) fn runner(&self) -> &Arc<dyn WorkUnitRunner> {
+        &self.runner
+    }
+
+    /// The lease TTL this controller acquires for each durable operation.
+    #[must_use]
+    pub(crate) fn lease_ttl(&self) -> time::Duration {
+        self.lease_ttl
+    }
+
+    /// The hydrator this controller re-hydrates Boot Packages through.
+    #[must_use]
+    pub(crate) fn hydrator(&self) -> &crate::ContextHydrator {
+        &self.hydrator
+    }
+
+    /// The context candidate provider this controller offers to the
+    /// hydrator.
+    #[must_use]
+    pub(crate) fn candidates(&self) -> &Arc<dyn ContextCandidateProvider> {
+        &self.candidates
+    }
+
+    /// The recorded context selection rule version this controller hydrates
+    /// under.
+    #[must_use]
+    pub(crate) fn context_rule_version(&self) -> &str {
+        &self.context_rule_version
+    }
+
+    /// Requests `loop_id` suspend at its current safe boundary
+    /// (`docs/07-session-rotation.md` §12), through the reducer's
+    /// [`LifecycleCommand::Suspend`], committing a Checkpoint if doing so
+    /// leaves an Episode terminal and not yet checkpointed.
+    ///
+    /// A no-op when the Loop is already terminal or already suspended.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError`] when the lease cannot be acquired or the
+    /// reducer refuses the command.
+    pub async fn suspend(
+        &self,
+        loop_id: LoopId,
+        reason: SuspensionReason,
+    ) -> Result<(), ControllerError> {
+        let lease = self
+            .ports
+            .store
+            .acquire_lease(AcquireLease {
+                loop_id,
+                holder_id: self.holder_id,
+                ttl: self.lease_ttl,
+            })
+            .await?;
+        let stored = self.ports.store.load(loop_id).await?;
+        let state = stored.state;
+        if state.execution.status.is_terminal() || state.execution.status == LoopStatus::Suspended {
+            return Ok(());
+        }
+
+        let suspended = self
+            .apply(
+                loop_id,
+                &lease,
+                &state,
+                LifecycleCommand::Suspend { reason },
+            )
+            .await?;
+        let newly_terminal_episode_id = suspended.episode.as_ref().and_then(|episode| {
+            (episode.status.is_terminal() && episode.terminal_checkpoint_version.is_none())
+                .then_some(episode.id)
+        });
+        if let Some(episode_id) = newly_terminal_episode_id {
+            let checkpoint = self.build_checkpoint(&suspended, episode_id);
+            self.commit(loop_id, &lease, &suspended, checkpoint, None)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Resumes a suspended Loop.
+    ///
+    /// `Suspended -> Active` has no `LifecycleCommand`: `loopward-core`
+    /// deliberately exposes it as a runtime-level operation
+    /// (`loopward_core::model` §`LoopStatus` doc comment), not a reducer
+    /// transition. This performs a direct, lease-fenced projection write
+    /// through [`LoopStore::commit_checkpoint`] instead — the only store
+    /// primitive that accepts an arbitrary caller-computed [`AggregateState`]
+    /// — flipping only [`loopward_core::LoopExecution::status`] and leaving
+    /// every other entity untouched.
+    ///
+    /// This is deliberately minimal: if the Episode active when the Loop
+    /// suspended left an unreconciled Attempt behind (neither terminal nor
+    /// merely suspended-and-safe), the *next* [`Self::advance`] call will
+    /// correctly refuse via the reducer's own
+    /// `attempt.reconciled_before_next_generation` invariant rather than
+    /// silently resuming into an unsafe state. Recognizing that case here
+    /// and reconciling it automatically is Task 10's job (Reconciliation and
+    /// Crash Recovery), not this one's.
+    ///
+    /// A no-op when the Loop is not currently suspended.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError`] when the lease cannot be acquired, the
+    /// store rejects the write, or the resulting state fails invariant
+    /// validation.
+    pub async fn resume(&self, loop_id: LoopId) -> Result<(), ControllerError> {
+        let lease = self
+            .ports
+            .store
+            .acquire_lease(AcquireLease {
+                loop_id,
+                holder_id: self.holder_id,
+                ttl: self.lease_ttl,
+            })
+            .await?;
+        let stored = self.ports.store.load(loop_id).await?;
+        let mut state = stored.state;
+        if state.execution.status != LoopStatus::Suspended {
+            return Ok(());
+        }
+
+        let expected_revision = state.execution.aggregate_revision;
+        let expected_checkpoint_version = state.execution.checkpoint_version;
+        let checkpoint = Checkpoint {
+            id: self.ports.ids.new_checkpoint_id(),
+            loop_id,
+            version: state.checkpoint.version + 1,
+            aggregate_revision: expected_revision + 1,
+            parent: Some(state.checkpoint.id),
+            episode_id: None,
+            integrity_digest: None,
+        };
+        state.execution.status = LoopStatus::Active;
+        state.execution.aggregate_revision = expected_revision + 1;
+        state.execution.checkpoint_version = checkpoint.version;
+        state.checkpoint = checkpoint.clone();
+        validate_invariants(&state)?;
+
+        self.ports
+            .store
+            .commit_checkpoint(CheckpointCommitRequest {
+                loop_id,
+                expected_revision,
+                expected_checkpoint_version,
+                fencing_token: lease.fencing_token,
+                checkpoint: checkpoint.clone(),
+                events: vec![LoopEvent::CheckpointCommitted { checkpoint }],
+                state,
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Explicitly cancels a Loop (`docs/09-public-api.md` §3: cancellation
+    /// is always explicit, never implied by a client disconnecting).
+    ///
+    /// Like [`Self::resume`], `Active -> Cancelled` has no `LifecycleCommand`
+    /// and is performed as a direct, lease-fenced projection write. Kept
+    /// deliberately minimal: this only flips the status when nothing is
+    /// live beneath the Loop (no active Episode, no open Session) — the same
+    /// precondition the reducer's own `Complete`/`Fail` commands require —
+    /// because forcing a *live* Episode's Session and Attempt to a
+    /// consistent terminal shape outside `decide`/`evolve` would duplicate
+    /// exactly the reasoning `apply_loop_failed` and
+    /// `apply_rotation_requested` already encode, and drifting from it would
+    /// be worse than refusing. Cancelling a Loop with a live Episode
+    /// requires suspending it first in Phase One.
+    ///
+    /// A no-op when the Loop is already terminal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::Invariant`] when an Episode or Session is
+    /// still live, and otherwise whatever [`Self::resume`] can return for
+    /// the same category of failure.
+    pub async fn cancel(&self, loop_id: LoopId) -> Result<(), ControllerError> {
+        let lease = self
+            .ports
+            .store
+            .acquire_lease(AcquireLease {
+                loop_id,
+                holder_id: self.holder_id,
+                ttl: self.lease_ttl,
+            })
+            .await?;
+        let stored = self.ports.store.load(loop_id).await?;
+        let mut state = stored.state;
+        if state.execution.status.is_terminal() {
+            return Ok(());
+        }
+        if state.active_episode().is_some() || state.open_session().is_some() {
+            return Err(ControllerError::Invariant(
+                "cannot cancel while an episode or session is in flight; suspend first".to_owned(),
+            ));
+        }
+
+        let expected_revision = state.execution.aggregate_revision;
+        let expected_checkpoint_version = state.execution.checkpoint_version;
+        let checkpoint = Checkpoint {
+            id: self.ports.ids.new_checkpoint_id(),
+            loop_id,
+            version: state.checkpoint.version + 1,
+            aggregate_revision: expected_revision + 1,
+            parent: Some(state.checkpoint.id),
+            episode_id: None,
+            integrity_digest: None,
+        };
+        state.execution.status = LoopStatus::Cancelled;
+        state.execution.aggregate_revision = expected_revision + 1;
+        state.execution.checkpoint_version = checkpoint.version;
+        state.checkpoint = checkpoint.clone();
+        validate_invariants(&state)?;
+
+        self.ports
+            .store
+            .commit_checkpoint(CheckpointCommitRequest {
+                loop_id,
+                expected_revision,
+                expected_checkpoint_version,
+                fencing_token: lease.fencing_token,
+                checkpoint: checkpoint.clone(),
+                events: vec![LoopEvent::CheckpointCommitted { checkpoint }],
+                state,
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Advances `loop_id` by at most one durable Episode transition to its
+    /// next safe boundary (`docs/07-session-rotation.md` §14).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError`] when the lease cannot be acquired, the
+    /// reducer refuses a command, hydration or verification fails outright,
+    /// the runner reports a protocol failure that is not otherwise handled
+    /// as a rotation, or the Loop has no Work Unit assigned. A collected
+    /// runner failure, a hard context budget, or a drain-time integrity
+    /// mismatch are not errors: they resolve to
+    /// [`OperationOutcome::Suspended`] with a committed Checkpoint recording
+    /// the best-known durable state.
+    pub async fn advance(&self, loop_id: LoopId) -> Result<OperationOutcome, ControllerError> {
+        let lease = self
+            .ports
+            .store
+            .acquire_lease(AcquireLease {
+                loop_id,
+                holder_id: self.holder_id,
+                ttl: self.lease_ttl,
+            })
+            .await?;
+
+        let stored = self.ports.store.load(loop_id).await?;
+        let state = stored.state;
+
+        if state.execution.status.is_terminal() {
+            return Ok(OperationOutcome::Terminal {
+                status: state.execution.status,
+            });
+        }
+        if state.execution.status == LoopStatus::Suspended {
+            return Ok(OperationOutcome::NoOp);
+        }
+        if state.active_episode().is_some() {
+            return Err(ControllerError::RecoveryRequired(loop_id));
+        }
+
+        match &state.work_unit {
+            None => Err(ControllerError::NoWorkUnit(loop_id)),
+            Some(work_unit) if work_unit_status_is_terminal(work_unit.status) => {
+                // Phase One's controller carries exactly one Work Unit per
+                // Loop; once it is terminal, nothing remains to attempt.
+                let completed = self
+                    .apply(loop_id, &lease, &state, LifecycleCommand::Complete)
+                    .await?;
+                Ok(OperationOutcome::Terminal {
+                    status: completed.execution.status,
+                })
+            }
+            Some(_) => {
+                let episode_id = self.ports.ids.new_episode_id();
+                let state = self
+                    .apply(
+                        loop_id,
+                        &lease,
+                        &state,
+                        LifecycleCommand::StartEpisode { episode_id },
+                    )
+                    .await?;
+                let kind = state.episode.as_ref().map(|episode| episode.kind);
+                if kind == Some(EpisodeKind::Verification) {
+                    Box::pin(self.run_verification_episode(loop_id, &lease, state, episode_id))
+                        .await
+                } else {
+                    Box::pin(self.run_execution_episode(loop_id, &lease, state, episode_id)).await
+                }
+            }
+        }
+    }
+
+    /// Repeatedly calls [`Self::advance`] until `condition` is met or a
+    /// limit in `limits` is reached.
+    ///
+    /// Loops by calling `advance`; this is not a second lifecycle path, and
+    /// it performs no hidden unbounded work
+    /// (`docs/07-session-rotation.md` §14).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::UnboundedRunUntil`] when `limits` names no
+    /// finite bound at all, and otherwise anything [`Self::advance`] can
+    /// return.
+    pub async fn run_until(
+        &self,
+        loop_id: LoopId,
+        condition: RunCondition,
+        limits: RunLimits,
+    ) -> Result<Vec<OperationOutcome>, ControllerError> {
+        // `max_resource_cost` only counts as a bound here when it actually
+        // sets `work_unit_attempts`: that is the one resource-cost limit
+        // this controller can enforce below (it already knows how many
+        // Attempts it started). A `max_resource_cost` that sets only
+        // `estimated_tokens` — which no port from any prior task lets this
+        // controller account for — would leave the loop genuinely
+        // unbounded despite looking bounded, so it does not satisfy this
+        // check (`docs/07-session-rotation.md` §14: "an unbounded hidden
+        // execution loop is not part of the public API").
+        let max_work_unit_attempts = limits
+            .max_resource_cost
+            .and_then(|cost| cost.work_unit_attempts);
+        if limits.max_episodes.is_none()
+            && limits.deadline.is_none()
+            && max_work_unit_attempts.is_none()
+        {
+            return Err(ControllerError::UnboundedRunUntil);
+        }
+
+        let mut outcomes = Vec::new();
+        let mut episodes = 0u32;
+        let mut work_unit_attempts = 0u32;
+        loop {
+            if let Some(max) = limits.max_episodes
+                && episodes >= max
+            {
+                break;
+            }
+            if let Some(deadline) = limits.deadline
+                && self.ports.clock.now() >= deadline
+            {
+                break;
+            }
+            if let Some(max) = max_work_unit_attempts
+                && work_unit_attempts >= max
+            {
+                break;
+            }
+
+            let outcome = Box::pin(self.advance(loop_id)).await?;
+            let stop = matches!(
+                (&outcome, condition),
+                (
+                    OperationOutcome::Terminal { .. } | OperationOutcome::NoOp,
+                    _
+                ) | (
+                    OperationOutcome::Suspended,
+                    RunCondition::UntilTerminalOrSuspended
+                )
+            );
+            if let OperationOutcome::EpisodeCompleted {
+                started_attempt, ..
+            } = &outcome
+            {
+                episodes += 1;
+                if *started_attempt {
+                    work_unit_attempts += 1;
+                }
+            }
+            outcomes.push(outcome);
+            if stop {
+                break;
+            }
+        }
+        Ok(outcomes)
+    }
+
+    // -----------------------------------------------------------------
+    // Episode branches
+    // -----------------------------------------------------------------
+
+    #[allow(clippy::too_many_lines)]
+    async fn run_execution_episode(
+        &self,
+        loop_id: LoopId,
+        lease: &LoopLease,
+        state: AggregateState,
+        episode_id: EpisodeId,
+    ) -> Result<OperationOutcome, ControllerError> {
+        let mut episode_span = self.open_episode_span(loop_id, episode_id, &state);
+
+        let work_unit = state
+            .work_unit
+            .clone()
+            .ok_or(ControllerError::NoWorkUnit(loop_id))?;
+
+        let capabilities = self.runner.capabilities().await?;
+        let budget = self.resolve_context_budget(work_unit.budget.context);
+        let session_generation = state.latest_generation() + 1;
+
+        let hydration_request = HydrationRequest {
+            checkpoint: state.checkpoint.clone(),
+            episode_id,
+            session_generation,
+            work_unit: work_unit.clone(),
+            capabilities,
+            budget,
+            context_rule_version: self.context_rule_version.clone(),
+            candidates: self.candidates.candidates(&work_unit, &state.checkpoint),
+        };
+
+        let hydrate_span = Span::start(
+            &self.ports.telemetry,
+            episode_span
+                .context()
+                .cloned()
+                .map_or_else(
+                    || SpanStart::new(span_name::CONTEXT_HYDRATE),
+                    |parent| SpanStart::new(span_name::CONTEXT_HYDRATE).with_parent(parent),
+                )
+                .with_attribute(
+                    attribute::CONTEXT_RULE_VERSION,
+                    self.context_rule_version.clone(),
+                ),
+        );
+        let report = self.hydrator.hydrate(hydration_request.clone()).await?;
+        drop(hydrate_span);
+        let selected_tokens = report.selected_tokens();
+        let hard_context_budget = selected_tokens >= budget.hard_input_limit_tokens;
+        let soft_context_budget = selected_tokens >= budget.soft_input_limit_tokens;
+
+        // The hard-budget admission check is evaluated on its own, before
+        // any Work Unit boundary exists to compete with it: nothing has run
+        // yet, so `hard_context_budget`/`soft_context_budget` are the only
+        // signals that could possibly apply at this point in the call.
+        let admission_decision = RotationPolicy::evaluate(&RotationContext {
+            soft_context_budget,
+            hard_context_budget,
+            ..RotationContext::default()
+        });
+
+        if admission_decision.primary_reason == Some(RotationReason::HardContextBudget) {
+            // The hard context budget stops admission before any model work
+            // is started: no Session, no Attempt, no runner call
+            // (`docs/07` §10).
+            let state = self.mark_hydrated(loop_id, lease, &state, &report).await?;
+            self.ensure_episode_terminal_and_commit(
+                loop_id,
+                lease,
+                state,
+                episode_id,
+                SuspensionReason::BudgetExceeded,
+            )
+            .await?;
+            episode_span.set_end_attribute(attribute::SUSPENSION_CODE, "budget_exceeded");
+            episode_span.set_end_attribute(attribute::OUTCOME, "suspended");
+            return Ok(OperationOutcome::Suspended);
+        }
+
+        let state = self.mark_hydrated(loop_id, lease, &state, &report).await?;
+
+        let session_id = self.ports.ids.new_session_id();
+        let state = self
+            .apply(
+                loop_id,
+                lease,
+                &state,
+                LifecycleCommand::StartSession {
+                    session_id,
+                    generation: session_generation,
+                },
+            )
+            .await?;
+
+        let attempt_id = self.ports.ids.new_attempt_id();
+        let idempotency_key = format!("attempt:{attempt_id}");
+        let state = self
+            .apply(
+                loop_id,
+                lease,
+                &state,
+                LifecycleCommand::PrepareAttempt {
+                    attempt_id,
+                    idempotency_key: idempotency_key.clone(),
+                },
+            )
+            .await?;
+
+        let mut execute_span = Span::start(
+            &self.ports.telemetry,
+            episode_span
+                .context()
+                .cloned()
+                .map_or_else(
+                    || SpanStart::new(span_name::WORK_UNIT_EXECUTE),
+                    |parent| SpanStart::new(span_name::WORK_UNIT_EXECUTE).with_parent(parent),
+                )
+                .with_attribute(attribute::ATTEMPT_ID, attempt_id.to_string()),
+        );
+        let request = WorkUnitRequest {
+            protocol_version: loopward_api::PROTOCOL_VERSION.to_owned(),
+            loop_id,
+            episode_id,
+            session_id,
+            session_generation,
+            work_unit: work_unit.clone(),
+            attempt_id,
+            idempotency_key,
+            boot_package: report.manifest.clone(),
+            resource_grants: Vec::new(),
+            output_contract: work_unit.output_contract.clone(),
+            budget: work_unit.budget,
+            deadline: None,
+            trace_context: self.ports.telemetry.trace_context(execute_span.handle()),
+        };
+
+        let Ok(handle) = self.runner.start(request).await else {
+            execute_span.set_error(
+                "runner_failure",
+                "the runner rejected or could not start the attempt",
+            );
+            let state = self
+                .apply(
+                    loop_id,
+                    lease,
+                    &state,
+                    LifecycleCommand::RequestRotation {
+                        reason: RotationReason::RunnerFailure,
+                    },
+                )
+                .await?;
+            self.ensure_episode_terminal_and_commit(
+                loop_id,
+                lease,
+                state,
+                episode_id,
+                SuspensionReason::Recovery,
+            )
+            .await?;
+            episode_span.set_end_attribute(
+                attribute::ROTATION_REASON,
+                RotationReason::RunnerFailure.label(),
+            );
+            episode_span.set_end_attribute(attribute::OUTCOME, "suspended");
+            return Ok(OperationOutcome::Suspended);
+        };
+        drop(execute_span);
+
+        let external_ref = handle
+            .external_execution_ref
+            .clone()
+            .unwrap_or_else(|| OpaqueRef::new(format!("attempt:{attempt_id}")));
+        let state = self
+            .apply(
+                loop_id,
+                lease,
+                &state,
+                LifecycleCommand::RecordRunnerStarted { external_ref },
+            )
+            .await?;
+
+        let mut collect_span = Span::start(
+            &self.ports.telemetry,
+            episode_span.context().cloned().map_or_else(
+                || SpanStart::new(span_name::WORK_UNIT_COLLECT),
+                |parent| SpanStart::new(span_name::WORK_UNIT_COLLECT).with_parent(parent),
+            ),
+        );
+        let Ok(collected) = self.runner.collect(&handle).await else {
+            collect_span.set_error(
+                "runner_failure",
+                "the runner could not produce a collectible result",
+            );
+            drop(collect_span);
+            let state = self
+                .apply(
+                    loop_id,
+                    lease,
+                    &state,
+                    LifecycleCommand::RequestRotation {
+                        reason: RotationReason::RunnerFailure,
+                    },
+                )
+                .await?;
+            self.ensure_episode_terminal_and_commit(
+                loop_id,
+                lease,
+                state,
+                episode_id,
+                SuspensionReason::Recovery,
+            )
+            .await?;
+            episode_span.set_end_attribute(
+                attribute::ROTATION_REASON,
+                RotationReason::RunnerFailure.label(),
+            );
+            episode_span.set_end_attribute(attribute::OUTCOME, "suspended");
+            return Ok(OperationOutcome::Suspended);
+        };
+        drop(collect_span);
+
+        let result = self
+            .finish_execution_attempt(
+                loop_id,
+                lease,
+                state,
+                episode_id,
+                hydration_request,
+                report.manifest.pinned_digest.clone(),
+                collected,
+                soft_context_budget,
+            )
+            .await;
+        match &result {
+            Ok(OperationOutcome::EpisodeCompleted {
+                checkpoint_version, ..
+            }) => {
+                episode_span.set_end_attribute(
+                    attribute::CHECKPOINT_VERSION,
+                    checkpoint_version.to_string(),
+                );
+                episode_span.set_end_attribute(attribute::OUTCOME, "completed");
+            }
+            Ok(OperationOutcome::Suspended) => {
+                episode_span.set_end_attribute(attribute::OUTCOME, "suspended");
+            }
+            Ok(_) => {}
+            Err(err) => episode_span.set_error("controller_error", err.to_string()),
+        }
+        result
+    }
+
+    /// Drains a collected result to a committed Episode boundary: the
+    /// drain-time pinned-integrity re-check, finalizing and recording the
+    /// result, and the closing rotation and Checkpoint commit.
+    ///
+    /// Factored out of [`Self::run_execution_episode`]'s tail. `pub(crate)`:
+    /// shared with [`crate::recovery::RecoveryManager`], which reaches this
+    /// exact tail after reconciling a runner that turns out to have already
+    /// completed (or re-collecting from one that has) — the drained result
+    /// still has to survive the identical integrity check before it may
+    /// commit, whether the Attempt was reconciled after a crash or collected
+    /// on the normal path.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn finish_execution_attempt(
+        &self,
+        loop_id: LoopId,
+        lease: &LoopLease,
+        state: AggregateState,
+        episode_id: EpisodeId,
+        hydration_request: HydrationRequest,
+        original_pinned_digest: String,
+        collected: WorkUnitResult,
+        soft_context_budget: bool,
+    ) -> Result<OperationOutcome, ControllerError> {
+        // Drain-time integrity re-check: pinned constraints must survive
+        // hydration and drain losslessly. Re-hydrating the same request and
+        // comparing pinned digests detects pinned state that moved
+        // underneath the run; a divergence means the drained result cannot
+        // commit (`docs/07` §11, Global Constraints).
+        let redrawn = self.hydrator.hydrate(hydration_request).await?;
+        if redrawn.manifest.pinned_digest != original_pinned_digest {
+            let state = self
+                .apply(
+                    loop_id,
+                    lease,
+                    &state,
+                    LifecycleCommand::RequestRotation {
+                        reason: RotationReason::ContextIntegrityFailure,
+                    },
+                )
+                .await?;
+            self.ensure_episode_terminal_and_commit(
+                loop_id,
+                lease,
+                state,
+                episode_id,
+                SuspensionReason::Recovery,
+            )
+            .await?;
+            return Ok(OperationOutcome::Suspended);
+        }
+
+        let result_ref = self.finalize_result(&collected).await?;
+        let state = self
+            .apply(
+                loop_id,
+                lease,
+                &state,
+                LifecycleCommand::RecordResult { result: result_ref },
+            )
+            .await?;
+
+        // The Attempt just finished: this is a genuine Work Unit boundary,
+        // evaluated alongside whatever budget signal was observed, through
+        // the same `RotationPolicy::evaluate` every signal goes through —
+        // not a hand-rolled shortcut that could disagree with
+        // `PRECEDENCE`'s own ranking. `WorkUnitBoundary` is mandatory and
+        // outranks the advisory `SoftContextBudget`, so it wins the primary
+        // slot whenever both apply; the budget signal still rides along in
+        // `signals` for whoever consults the full decision, even though
+        // only the primary reason is durably recorded on this event today.
+        let rotation_decision = RotationPolicy::evaluate(&RotationContext {
+            work_unit_boundary: true,
+            soft_context_budget,
+            ..RotationContext::default()
+        });
+        let reason = rotation_decision
+            .primary_reason
+            .unwrap_or(RotationReason::WorkUnitBoundary);
+        let committed = self
+            .rotate_and_commit(loop_id, lease, state, episode_id, reason)
+            .await?;
+
+        Ok(OperationOutcome::EpisodeCompleted {
+            episode_id,
+            checkpoint_version: committed.checkpoint.version,
+            started_attempt: true,
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn run_verification_episode(
+        &self,
+        loop_id: LoopId,
+        lease: &LoopLease,
+        state: AggregateState,
+        episode_id: EpisodeId,
+    ) -> Result<OperationOutcome, ControllerError> {
+        let mut episode_span = self.open_episode_span(loop_id, episode_id, &state);
+
+        let work_unit = state
+            .work_unit
+            .clone()
+            .ok_or(ControllerError::NoWorkUnit(loop_id))?;
+        let attempt = state.attempt.clone().ok_or_else(|| {
+            ControllerError::Invariant(
+                "a verification episode started with no Attempt in the projection".to_owned(),
+            )
+        })?;
+        let result_ref = attempt.result_ref.clone().ok_or_else(|| {
+            ControllerError::Invariant(
+                "a verification episode started with an Attempt that carries no result".to_owned(),
+            )
+        })?;
+
+        let capabilities = self.runner.capabilities().await?;
+        let budget = self.resolve_context_budget(work_unit.budget.context);
+        let session_generation = state.latest_generation() + 1;
+
+        let hydration_request = HydrationRequest {
+            checkpoint: state.checkpoint.clone(),
+            episode_id,
+            session_generation,
+            work_unit: work_unit.clone(),
+            capabilities,
+            budget,
+            context_rule_version: self.context_rule_version.clone(),
+            candidates: self.candidates.candidates(&work_unit, &state.checkpoint),
+        };
+        let hydrate_span = Span::start(
+            &self.ports.telemetry,
+            episode_span
+                .context()
+                .cloned()
+                .map_or_else(
+                    || SpanStart::new(span_name::CONTEXT_HYDRATE),
+                    |parent| SpanStart::new(span_name::CONTEXT_HYDRATE).with_parent(parent),
+                )
+                .with_attribute(
+                    attribute::CONTEXT_RULE_VERSION,
+                    self.context_rule_version.clone(),
+                ),
+        );
+        let report = self.hydrator.hydrate(hydration_request).await?;
+        drop(hydrate_span);
+        let state = self.mark_hydrated(loop_id, lease, &state, &report).await?;
+
+        let session_id = self.ports.ids.new_session_id();
+        let state = self
+            .apply(
+                loop_id,
+                lease,
+                &state,
+                LifecycleCommand::StartSession {
+                    session_id,
+                    generation: session_generation,
+                },
+            )
+            .await?;
+
+        let outcome = self
+            .evaluate_verification(
+                loop_id,
+                state.checkpoint.version,
+                &work_unit,
+                &attempt,
+                &result_ref,
+                episode_span.context(),
+            )
+            .await?;
+
+        let state = self
+            .apply(
+                loop_id,
+                lease,
+                &state,
+                LifecycleCommand::RecordVerification { outcome },
+            )
+            .await?;
+
+        if state.execution.status == LoopStatus::Suspended {
+            let committed = self
+                .ensure_episode_terminal_and_commit(
+                    loop_id,
+                    lease,
+                    state,
+                    episode_id,
+                    SuspensionReason::VerificationPending,
+                )
+                .await?;
+            let _ = committed;
+            episode_span.set_end_attribute(attribute::OUTCOME, "suspended");
+            return Ok(OperationOutcome::Suspended);
+        }
+
+        let committed = self
+            .rotate_and_commit(
+                loop_id,
+                lease,
+                state,
+                episode_id,
+                RotationReason::VerificationBoundary,
+            )
+            .await?;
+        episode_span.set_end_attribute(
+            attribute::CHECKPOINT_VERSION,
+            committed.checkpoint.version.to_string(),
+        );
+        episode_span.set_end_attribute(attribute::OUTCOME, "completed");
+        Ok(OperationOutcome::EpisodeCompleted {
+            episode_id,
+            checkpoint_version: committed.checkpoint.version,
+            started_attempt: false,
+        })
+    }
+
+    // -----------------------------------------------------------------
+    // Shared step helpers
+    // -----------------------------------------------------------------
+
+    /// `pub(crate)`: shared with [`crate::recovery::RecoveryManager`], which
+    /// must resolve the identical budget a crashed Episode was hydrated
+    /// under before it can safely redo the drain-time integrity check.
+    pub(crate) fn resolve_context_budget(
+        &self,
+        requested: Option<ContextBudgetRequest>,
+    ) -> ContextBudget {
+        let requested = requested.unwrap_or_default();
+        ContextBudget {
+            model_window_tokens: self.default_budget.model_window_tokens,
+            soft_input_limit_tokens: requested
+                .soft_input_limit_tokens
+                .unwrap_or(self.default_budget.soft_input_limit_tokens),
+            hard_input_limit_tokens: requested
+                .hard_input_limit_tokens
+                .unwrap_or(self.default_budget.hard_input_limit_tokens),
+            reserved_output_tokens: self.default_budget.reserved_output_tokens,
+            reserved_tool_tokens: self.default_budget.reserved_tool_tokens,
+            safety_margin_tokens: self.default_budget.safety_margin_tokens,
+        }
+    }
+
+    /// Opens this Episode's root `loopward.episode` span
+    /// (`docs/08-tracing-and-observability.md` §4, §5): one top-level trace
+    /// per Episode, linked via `continuation_of` to the prior Episode's
+    /// trace when this controller has seen one for `loop_id` before
+    /// (best-effort, in-process only — see [`Self::trace_continuity`]'s doc
+    /// comment).
+    ///
+    /// Deliberately does **not** write anything onto `state`/`AggregateState`:
+    /// an earlier version of this method stamped the new trace id onto
+    /// `state.episode.trace_id`, but that field then flowed into whatever
+    /// Checkpoint the Episode eventually committed, making the durably
+    /// persisted Checkpoint bytes vary by telemetry configuration — exactly
+    /// what `docs/08` §13/§15 rules out ("telemetry loss cannot corrupt …
+    /// durable recovery"), and unreproducible by replaying the event
+    /// journal through `evolve` (no `LifecycleCommand`/`LoopEvent` ever sets
+    /// it). Trace continuity lives *only* in [`Self::trace_continuity`],
+    /// which is exactly the best-effort, in-process-only, telemetry-disabled-
+    /// safe place for it.
+    fn open_episode_span(
+        &self,
+        loop_id: LoopId,
+        episode_id: EpisodeId,
+        state: &AggregateState,
+    ) -> Span {
+        let continuation = self.trace_continuity_context(loop_id);
+
+        let mut start = SpanStart::new(span_name::EPISODE)
+            .with_attribute(attribute::LOOP_ID, loop_id.to_string())
+            .with_attribute(attribute::EPISODE_ID, episode_id.to_string())
+            .with_attribute(
+                attribute::CHECKPOINT_VERSION,
+                state.checkpoint.version.to_string(),
+            );
+        if let Some(continuation) = &continuation {
+            start = start.with_link(SpanLink::new(
+                SpanLinkKind::ContinuationOf,
+                continuation.trace_id.clone(),
+            ));
+        }
+        let span = Span::start(&self.ports.telemetry, start);
+
+        if let Some(context) = span.context() {
+            self.trace_continuity
+                .lock()
+                .expect("trace continuity lock poisoned")
+                .insert(loop_id, context.clone());
+        }
+        span
+    }
+
+    /// The most recent Episode trace this controller has seen for
+    /// `loop_id`, if any (`docs/08` §4, §7).
+    ///
+    /// Best-effort and in-process only — see [`Self::trace_continuity`]'s
+    /// doc comment. `pub(crate)`: [`crate::recovery::RecoveryManager`] reads
+    /// this to link its own `loopward.recovery.reconcile` span back to the
+    /// Episode it is recovering, when the same process instance ran both.
+    #[must_use]
+    pub(crate) fn trace_continuity_context(&self, loop_id: LoopId) -> Option<SpanContext> {
+        self.trace_continuity
+            .lock()
+            .expect("trace continuity lock poisoned")
+            .get(&loop_id)
+            .cloned()
+    }
+
+    /// `pub(crate)`: shared with [`crate::recovery::RecoveryManager`], which
+    /// redoes hydration exactly the same way when a crash happened before
+    /// `context.hydrated` was durably recorded.
+    pub(crate) async fn mark_hydrated(
+        &self,
+        loop_id: LoopId,
+        lease: &LoopLease,
+        state: &AggregateState,
+        report: &HydrationReport,
+    ) -> Result<AggregateState, ControllerError> {
+        let manifest_ref = self.finalize_manifest(&report.manifest).await?;
+        self.apply(
+            loop_id,
+            lease,
+            state,
+            LifecycleCommand::MarkHydrated {
+                manifest: manifest_ref,
+            },
+        )
+        .await
+    }
+
+    /// Builds a [`VerificationPlan`] for `work_unit`'s declared reference and
+    /// evaluates `result_ref` against it, returning the outcome.
+    ///
+    /// `pub(crate)` and factored out of [`Self::run_verification_episode`]:
+    /// shared with [`crate::recovery::RecoveryManager`], which redoes
+    /// Loopward's own verification judgement from scratch when a crash
+    /// happened before `verification.completed` was durably recorded
+    /// (`docs/06-verification-and-recovery.md` §12) — verification is a pure
+    /// Loopward computation over durable inputs, so redoing it is always
+    /// safe, unlike blindly repeating a runner's external effect.
+    ///
+    /// `parent` is the enclosing Episode span's context, when one is active
+    /// ([`Self::run_verification_episode`] always has one;
+    /// [`crate::recovery::RecoveryManager`]'s recovery-driven re-evaluation
+    /// currently passes `None`, so a recovered verification judgement is
+    /// traced as its own standalone span rather than nested under a
+    /// recovery span — an accepted, best-effort simplification, not a
+    /// correctness concern per `docs/08` §13).
+    pub(crate) async fn evaluate_verification(
+        &self,
+        loop_id: LoopId,
+        checkpoint_version: u64,
+        work_unit: &WorkUnit,
+        attempt: &loopward_core::WorkUnitAttempt,
+        result_ref: &ResourceRef,
+        parent: Option<&SpanContext>,
+    ) -> Result<VerificationOutcome, ControllerError> {
+        let mut span = Span::start(
+            &self.ports.telemetry,
+            parent
+                .cloned()
+                .map_or_else(
+                    || SpanStart::new(span_name::VERIFICATION_EVALUATE),
+                    |parent| SpanStart::new(span_name::VERIFICATION_EVALUATE).with_parent(parent),
+                )
+                .with_attribute(attribute::WORK_UNIT_ID, work_unit.id.to_string())
+                .with_attribute(attribute::ATTEMPT_ID, attempt.id.to_string())
+                .with_attribute(
+                    attribute::CHECKPOINT_VERSION,
+                    checkpoint_version.to_string(),
+                ),
+        );
+        let template = self
+            .plans
+            .resolve(&work_unit.verification_plan)
+            .ok_or_else(|| {
+                ControllerError::UnknownVerificationPlan(
+                    work_unit.verification_plan.reference.clone(),
+                )
+            })?;
+
+        let result_bytes = self.ports.resources.resolve(result_ref).await?;
+        let result: WorkUnitResult = serde_json::from_slice(&result_bytes)?;
+
+        let target = VerificationTarget {
+            work_unit_id: work_unit.id,
+            result_digest: Digest::new(result_ref.digest.clone().unwrap_or_default()),
+            resource_digests: BTreeMap::new(),
+            workspace_revision: None,
+            plan_version: template.version,
+            constraint_digest: None,
+        };
+        let plan = VerificationPlan {
+            id: template.id,
+            version: template.version,
+            target,
+            gates: template.gates,
+            aggregation: template.aggregation,
+            remediation_policy: template.remediation_policy,
+        };
+        let plan_id = plan.id.clone();
+        let plan_version = plan.version;
+
+        let lineage = FindingLineage {
+            loop_id,
+            work_unit_id: work_unit.id,
+            attempt_id: attempt.id,
+            plan_id,
+            plan_version,
+            checkpoint_version,
+        };
+
+        let run = self
+            .verification
+            .evaluate(VerificationRequest {
+                plan,
+                result: Arc::new(result),
+                lineage,
+                prior_findings: Vec::new(),
+                resources: Arc::clone(&self.ports.resources),
+                observed_at: self.ports.clock.now(),
+            })
+            .await?;
+        span.set_end_attribute(attribute::VERIFICATION_OUTCOME, run.outcome.label());
+        Ok(run.outcome)
+    }
+
+    async fn finalize_manifest(
+        &self,
+        manifest: &BootPackageManifest,
+    ) -> Result<ResourceRef, ControllerError> {
+        let bytes = serde_json::to_vec(manifest)?;
+        let handle = self
+            .ports
+            .resources
+            .begin(ResourceBeginHint {
+                media_type: Some("application/json".to_owned()),
+                summary: Some("boot package manifest".to_owned()),
+            })
+            .await?;
+        self.ports.resources.write(&handle, &bytes).await?;
+        let mut resource_ref = self.ports.resources.finalize(handle).await?;
+        resource_ref.digest = Some(crate::context::content_digest(&bytes));
+        Ok(resource_ref)
+    }
+
+    /// `pub(crate)`: shared with [`crate::recovery::RecoveryManager`], which
+    /// finalizes a freshly re-collected result exactly the same way a
+    /// normal Episode does.
+    pub(crate) async fn finalize_result(
+        &self,
+        result: &WorkUnitResult,
+    ) -> Result<ResourceRef, ControllerError> {
+        let bytes = serde_json::to_vec(result)?;
+        let handle = self
+            .ports
+            .resources
+            .begin(ResourceBeginHint {
+                media_type: Some("application/json".to_owned()),
+                summary: Some("work unit result".to_owned()),
+            })
+            .await?;
+        self.ports.resources.write(&handle, &bytes).await?;
+        let mut resource_ref = self.ports.resources.finalize(handle).await?;
+        resource_ref.digest = Some(crate::context::content_digest(&bytes));
+        Ok(resource_ref)
+    }
+
+    /// Decides and evolves `command` against `state`, then durably appends
+    /// the resulting events. Returns the locally folded state rather than
+    /// the store's returned projection — see the module documentation's
+    /// note on the `LoopStore::append` projection gap.
+    ///
+    /// `pub(crate)`: this is the one `decide -> evolve -> validate_invariants
+    /// -> single fenced store write` pattern every mutation in this crate
+    /// uses (Global Constraints: "every state mutation MUST use optimistic
+    /// concurrency and lease fencing"). [`crate::recovery::RecoveryManager`]
+    /// reuses it verbatim rather than re-implementing the same fencing and
+    /// validation for the reconciling commands recovery already has a
+    /// `LifecycleCommand` for (e.g. `RequestRotation`, `RecordResult`,
+    /// `RecordVerification`, `Suspend`).
+    pub(crate) async fn apply(
+        &self,
+        loop_id: LoopId,
+        lease: &LoopLease,
+        state: &AggregateState,
+        command: LifecycleCommand,
+    ) -> Result<AggregateState, ControllerError> {
+        let events = decide(state, &command, &self.policy)?;
+        let expected_revision = state.execution.aggregate_revision;
+        let mut next = state.clone();
+        for event in &events {
+            next = evolve(next, event)?;
+        }
+        validate_invariants(&next)?;
+        self.ports
+            .store
+            .append(loop_id, expected_revision, lease.fencing_token, events)
+            .await?;
+        Ok(next)
+    }
+
+    /// Decides and evolves a [`LifecycleCommand::CommitCheckpoint`] against
+    /// `state`, then atomically commits it.
+    ///
+    /// `rotation_reason`, when present, is recorded as `loopward.rotation.reason`
+    /// on the commit span and as a `rotation.requested` diagnostic event
+    /// (`docs/08-tracing-and-observability.md` §6, §9) — this is the one
+    /// place every routine rotation (`WorkUnitBoundary`, `VerificationBoundary`,
+    /// and everything [`Self::rotate_and_commit`] is asked to record) becomes
+    /// traceable, not just the runner-failure suspension paths that already
+    /// set it directly on their enclosing Episode span.
+    ///
+    /// `pub(crate)`: shared with [`crate::recovery::RecoveryManager`] for the
+    /// same reason as [`Self::apply`].
+    pub(crate) async fn commit(
+        &self,
+        loop_id: LoopId,
+        lease: &LoopLease,
+        state: &AggregateState,
+        checkpoint: Checkpoint,
+        rotation_reason: Option<RotationReason>,
+    ) -> Result<AggregateState, ControllerError> {
+        let mut span = Span::start(
+            &self.ports.telemetry,
+            self.trace_continuity_context(loop_id)
+                .map_or_else(
+                    || SpanStart::new(span_name::CHECKPOINT_COMMIT),
+                    |parent| SpanStart::new(span_name::CHECKPOINT_COMMIT).with_parent(parent),
+                )
+                .with_attribute(attribute::LOOP_ID, loop_id.to_string())
+                .with_attribute(
+                    attribute::CHECKPOINT_VERSION,
+                    checkpoint.version.to_string(),
+                ),
+        );
+        if let Some(reason) = rotation_reason {
+            let label = reason.label();
+            span.set_end_attribute(attribute::ROTATION_REASON, label);
+            span.event(
+                TelemetryEvent::new(event_name::ROTATION_REQUESTED)
+                    .with_attribute(attribute::ROTATION_REASON, label),
+            );
+        }
+        let command = LifecycleCommand::CommitCheckpoint {
+            checkpoint: checkpoint.clone(),
+        };
+        let events = decide(state, &command, &self.policy)?;
+        let expected_revision = state.execution.aggregate_revision;
+        let expected_checkpoint_version = state.execution.checkpoint_version;
+        let mut next = state.clone();
+        for event in &events {
+            next = evolve(next, event)?;
+        }
+        validate_invariants(&next)?;
+        let result = self
+            .ports
+            .store
+            .commit_checkpoint(CheckpointCommitRequest {
+                loop_id,
+                expected_revision,
+                expected_checkpoint_version,
+                fencing_token: lease.fencing_token,
+                checkpoint,
+                events,
+                state: next.clone(),
+            })
+            .await;
+        if let Err(err) = &result {
+            span.set_error("store_error", err.to_string());
+        }
+        result?;
+        Ok(next)
+    }
+
+    /// Builds the next Checkpoint for `episode_id`, continuing from
+    /// `state.checkpoint`.
+    ///
+    /// `pub(crate)`: shared with [`crate::recovery::RecoveryManager`], which
+    /// mints Checkpoints through the identical helper when it finishes an
+    /// Episode a crash interrupted.
+    pub(crate) fn build_checkpoint(
+        &self,
+        state: &AggregateState,
+        episode_id: EpisodeId,
+    ) -> Checkpoint {
+        let digest = crate::context::content_digest(
+            serde_json::to_vec(state).unwrap_or_default().as_slice(),
+        );
+        Checkpoint {
+            id: self.ports.ids.new_checkpoint_id(),
+            loop_id: state.execution.id,
+            version: state.checkpoint.version + 1,
+            aggregate_revision: state.execution.aggregate_revision,
+            parent: Some(state.checkpoint.id),
+            episode_id: Some(episode_id),
+            integrity_digest: Some(digest),
+        }
+    }
+
+    /// Requests a normal (non-failure) rotation and commits the resulting
+    /// terminal Checkpoint for this Episode.
+    ///
+    /// `pub(crate)`: shared with [`crate::recovery::RecoveryManager`], which
+    /// finishes an interrupted Episode's normal rotation the same way a
+    /// completed `advance` call would have.
+    pub(crate) async fn rotate_and_commit(
+        &self,
+        loop_id: LoopId,
+        lease: &LoopLease,
+        state: AggregateState,
+        episode_id: EpisodeId,
+        reason: RotationReason,
+    ) -> Result<AggregateState, ControllerError> {
+        let state = self
+            .apply(
+                loop_id,
+                lease,
+                &state,
+                LifecycleCommand::RequestRotation { reason },
+            )
+            .await?;
+        let checkpoint = self.build_checkpoint(&state, episode_id);
+        self.commit(loop_id, lease, &state, checkpoint, Some(reason))
+            .await
+    }
+
+    /// Ensures the Loop is suspended (issuing [`LifecycleCommand::Suspend`]
+    /// only if it is not already), then commits the resulting terminal
+    /// Checkpoint for this Episode.
+    ///
+    /// Used by every non-happy-path exit: a runner failure, a hard context
+    /// budget, a drain-time integrity mismatch, or a verification outcome
+    /// that itself suspended the Loop. Some of those already suspend the
+    /// Loop as part of the event they just applied (embedded in
+    /// [`LifecycleCommand::RequestRotation`]'s runner-failure disposition,
+    /// or in [`LifecycleCommand::RecordVerification`]'s suspended outcome);
+    /// others do not (a runner that never even started, or a normal
+    /// rotation whose drain turned out to be compromised). Checking rather
+    /// than assuming keeps this one helper correct for both.
+    ///
+    /// `pub(crate)`: shared with [`crate::recovery::RecoveryManager`], which
+    /// closes out an interrupted Episode into `Suspended` through the
+    /// identical path a graceful in-process failure already uses.
+    pub(crate) async fn ensure_episode_terminal_and_commit(
+        &self,
+        loop_id: LoopId,
+        lease: &LoopLease,
+        state: AggregateState,
+        episode_id: EpisodeId,
+        suspension_reason: SuspensionReason,
+    ) -> Result<AggregateState, ControllerError> {
+        let state = if state.execution.status == LoopStatus::Active {
+            self.apply(
+                loop_id,
+                lease,
+                &state,
+                LifecycleCommand::Suspend {
+                    reason: suspension_reason,
+                },
+            )
+            .await?
+        } else {
+            state
+        };
+        let checkpoint = self.build_checkpoint(&state, episode_id);
+        self.commit(loop_id, lease, &state, checkpoint, None).await
+    }
+}

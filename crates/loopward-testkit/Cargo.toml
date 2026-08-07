@@ -1,0 +1,24 @@
+[package]
+name = "loopward-testkit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+loopward-api = { path = "../loopward-api" }
+loopward-core = { path = "../loopward-core" }
+loopward-observability = { path = "../loopward-observability" }
+loopward-runtime = { path = "../loopward-runtime" }
+serde_json = { workspace = true }
+time = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+loopward-store-sqlite = { path = "../loopward-store-sqlite" }
+tempfile = { workspace = true }
+tokio = { workspace = true }

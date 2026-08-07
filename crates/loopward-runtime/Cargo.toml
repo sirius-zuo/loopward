@@ -1,0 +1,26 @@
+[package]
+name = "loopward-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+loopward-api = { path = "../loopward-api" }
+loopward-core = { path = "../loopward-core" }
+loopward-observability = { path = "../loopward-observability" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+# Scoped to the deterministic verification gate, which runs a configured
+# check command (a test suite, a linter, a checksum) against a Work Unit's
+# output. This is verification's own narrow use of subprocess execution, not
+# a `WorkUnitRunner`: launching a Work Unit Attempt remains an adapter's job.
+tokio = { workspace = true }
+uuid = { workspace = true }

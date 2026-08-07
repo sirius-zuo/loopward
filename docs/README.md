@@ -24,6 +24,8 @@ Loopward is an independent loop engineering framework for durable, context-effic
 ## Implementation Plans
 
 - [Phase One Implementation Plan](superpowers/plans/2026-07-29-loopward-phase-one.md)
+- [Phase One Evaluation Report Template](phase-one-evaluation-template.md)
+- [Phase One Conformance Report](phase-one-conformance.md)
 
 ## Normative Language
 
