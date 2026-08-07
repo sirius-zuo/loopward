@@ -196,14 +196,14 @@ PR #3's companion perf change, "resolve required hydration candidates concurrent
 
 ### Implementation Sources
 
-- crates/loopward-runtime/src/context/mod.rs (module: ContextCandidate, HydrationRequest, HydrationReport, CandidateOutcome, ExclusionReason, CandidateDisposition, HydrationError, ContextHydrator with hydrate and hydrate_manifest, resource_grants_for_manifest)
-- crates/loopward-runtime/src/context/hydrator.rs (module: SelectionBucket and the deterministic pipeline function hydrate, plus project_candidates, rank, check_work_unit_constraints, price_required, price_optional, stale_exclusion, and assemble)
-- crates/loopward-runtime/src/context/budget.rs (module: available_boot_tokens, heuristic_token_estimate, BudgetLedger, REFERENCE_ONLY_TOKENS)
-- crates/loopward-runtime/src/context/manifest.rs (module: checkpoint_ref_for, content_digest, pinned_digest, seal, BOOT_PACKAGE_MANIFEST_SCHEMA_VERSION)
-- crates/loopward-api/src/context.rs (referenced not owned: the wire DTOs this page describes — ContextControlLevel, ContextCapabilities, ContextClass, ContextPriority, Fidelity, Sensitivity, Validity, EstimateMethod, ContextItem, ContextBudgetRequest, ContextBudget, BootPackageManifest, ResourcePermission, ResourceGrant, VerificationStatus, StateAssertionProposal, OpenIssueProposal, ObservationProposal, DecisionProposal, ContinuationProposal, and HandoffProposal)
-- crates/loopward-api/src/work_unit.rs (referenced not owned: WorkUnitRequest.resource_grants and WorkUnitRequest.boot_package, the fields a hydrated manifest and its resource grants are delivered through)
-- crates/loopward-runtime/src/controller/advance.rs (referenced not owned: the primary boot path call site that supplies resource_grants_for_manifest's output to a Work Unit Attempt request)
-- crates/loopward-runtime/src/recovery/reconcile.rs (referenced not owned: the crash-recovery reconciliation call site for resource_grants_for_manifest)
+- `crates/loopward-runtime/src/context/mod.rs` (module: ContextCandidate, HydrationRequest, HydrationReport, CandidateOutcome, ExclusionReason, CandidateDisposition, HydrationError, ContextHydrator with hydrate and hydrate_manifest, resource_grants_for_manifest)
+- `crates/loopward-runtime/src/context/hydrator.rs` (module: SelectionBucket and the deterministic pipeline function hydrate, plus project_candidates, rank, check_work_unit_constraints, price_required, price_optional, stale_exclusion, and assemble)
+- `crates/loopward-runtime/src/context/budget.rs` (module: available_boot_tokens, heuristic_token_estimate, BudgetLedger, REFERENCE_ONLY_TOKENS)
+- `crates/loopward-runtime/src/context/manifest.rs` (module: checkpoint_ref_for, content_digest, pinned_digest, seal, BOOT_PACKAGE_MANIFEST_SCHEMA_VERSION)
+- `crates/loopward-api/src/context.rs` (referenced not owned: the wire DTOs this page describes — ContextControlLevel, ContextCapabilities, ContextClass, ContextPriority, Fidelity, Sensitivity, Validity, EstimateMethod, ContextItem, ContextBudgetRequest, ContextBudget, BootPackageManifest, ResourcePermission, ResourceGrant, VerificationStatus, StateAssertionProposal, OpenIssueProposal, ObservationProposal, DecisionProposal, ContinuationProposal, and HandoffProposal)
+- `crates/loopward-api/src/work_unit.rs` (referenced not owned: WorkUnitRequest.resource_grants and WorkUnitRequest.boot_package, the fields a hydrated manifest and its resource grants are delivered through)
+- `crates/loopward-runtime/src/controller/advance.rs` (referenced not owned: the primary boot path call site that supplies resource_grants_for_manifest's output to a Work Unit Attempt request)
+- `crates/loopward-runtime/src/recovery/reconcile.rs` (referenced not owned: the crash-recovery reconciliation call site for resource_grants_for_manifest)
 
 ## Related Pages
 
