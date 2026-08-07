@@ -736,6 +736,7 @@ fn genesis_state(loop_id: LoopId, work_unit: Option<WorkUnit>) -> AggregateState
             checkpoint_version: 0,
             active_episode: None,
             active_work_unit: work_unit.as_ref().map(|work_unit| work_unit.id),
+            episode_count: 0,
             budget: ResourceBudget::default(),
         },
         episode: None,
@@ -908,6 +909,7 @@ fn closed_session_generation_never_reopens() {
             checkpoint_version: 1,
             active_episode: Some(episode_id),
             active_work_unit: None,
+            episode_count: 0,
             budget: ResourceBudget::default(),
         },
         episode: Some(Episode {

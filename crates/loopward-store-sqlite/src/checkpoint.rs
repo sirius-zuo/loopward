@@ -17,6 +17,8 @@
 //!
 //! [`LoopStore`]: loopward_runtime::ports::LoopStore
 
+use std::collections::BTreeSet;
+
 use loopward_api::ids::{EpisodeId, LoopId, Timestamp};
 use loopward_core::{
     AggregateState, Checkpoint, Episode, EpisodeStatus, LoopEvent, RuntimeSession, SessionStatus,
@@ -510,38 +512,74 @@ async fn write_attempt(
 /// Records this Checkpoint's resource edges, rejecting any resource that is
 /// not durably finalized (§10: "unfinalized resources cannot enter a
 /// Checkpoint").
+///
+/// Batched into one `SELECT ... IN (...)` and one multi-row `INSERT`
+/// instead of one round trip per edge: a Checkpoint can reference up to
+/// ~5 resources (hydrated manifest, boot manifest, work-unit inputs, boot
+/// package, result), and this runs on every Episode boundary.
 async fn write_resource_edges(
     connection: &mut SqliteConnection,
     loop_id: LoopId,
     state: &AggregateState,
 ) -> Result<(), SqliteStoreError> {
     let checkpoint_version = sql_i64("checkpoint version", state.execution.checkpoint_version)?;
+    let edges = referenced_resources(state);
+    if edges.is_empty() {
+        return Ok(());
+    }
 
-    for (uri, relation) in referenced_resources(state) {
-        let finalized = sqlx::query("SELECT finalized FROM resources WHERE resource_uri = ?1")
-            .bind(uri.clone())
-            .fetch_optional(&mut *connection)
-            .await?;
-        match finalized {
-            None => return Err(SqliteStoreError::UnknownResource { uri }),
-            Some(row) if row.try_get::<i64, _>(0)? != 1 => {
-                return Err(SqliteStoreError::ResourceNotFinalized { uri });
+    let distinct_uris: Vec<&str> = {
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        edges
+            .iter()
+            .filter(|(uri, _)| seen.insert(uri.as_str()))
+            .map(|(uri, _)| uri.as_str())
+            .collect()
+    };
+
+    let mut select = sqlx::QueryBuilder::new(
+        "SELECT resource_uri, finalized FROM resources WHERE resource_uri IN (",
+    );
+    let mut separated = select.separated(", ");
+    for uri in &distinct_uris {
+        separated.push_bind(*uri);
+    }
+    separated.push_unseparated(")");
+    let rows = select.build().fetch_all(&mut *connection).await?;
+
+    let finalized: std::collections::HashMap<String, i64> = rows
+        .iter()
+        .map(|row| -> Result<(String, i64), SqliteStoreError> {
+            Ok((row.try_get::<String, _>(0)?, row.try_get::<i64, _>(1)?))
+        })
+        .collect::<Result<_, _>>()?;
+
+    for (uri, _relation) in &edges {
+        match finalized.get(uri.as_str()) {
+            None => {
+                return Err(SqliteStoreError::UnknownResource { uri: uri.clone() });
+            }
+            Some(value) if *value != 1 => {
+                return Err(SqliteStoreError::ResourceNotFinalized {
+                    uri: uri.clone(),
+                });
             }
             Some(_) => {}
         }
-
-        sqlx::query(
-            "INSERT INTO resource_edges (loop_id, checkpoint_version, resource_uri, relation) \
-             VALUES (?1, ?2, ?3, ?4) \
-             ON CONFLICT(loop_id, checkpoint_version, resource_uri, relation) DO NOTHING",
-        )
-        .bind(loop_id.to_string())
-        .bind(checkpoint_version)
-        .bind(uri)
-        .bind(relation)
-        .execute(&mut *connection)
-        .await?;
     }
+
+    let mut insert = sqlx::QueryBuilder::new(
+        "INSERT INTO resource_edges (loop_id, checkpoint_version, resource_uri, relation) ",
+    );
+    insert.push_values(edges.iter(), |mut row, (uri, relation)| {
+        row.push_bind(loop_id.to_string())
+            .push_bind(checkpoint_version)
+            .push_bind(uri.clone())
+            .push_bind(*relation);
+    });
+    insert
+        .push(" ON CONFLICT(loop_id, checkpoint_version, resource_uri, relation) DO NOTHING");
+    insert.build().execute(&mut *connection).await?;
 
     Ok(())
 }

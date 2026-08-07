@@ -72,6 +72,7 @@ fn required_attribute_keys_are_all_dotted_under_the_loopward_namespace() {
 fn conditional_attribute_keys_match_the_documented_set() {
     let conditional = [
         attribute::ROTATION_REASON,
+        attribute::ROTATION_SIGNALS,
         attribute::SUSPENSION_CODE,
         attribute::FAILURE_CODE,
         attribute::RECOVERY_OUTCOME,
@@ -86,6 +87,7 @@ fn conditional_attribute_keys_match_the_documented_set() {
         conditional,
         [
             "loopward.rotation.reason",
+            "loopward.rotation.signals",
             "loopward.suspension.code",
             "loopward.failure.code",
             "loopward.recovery.outcome",

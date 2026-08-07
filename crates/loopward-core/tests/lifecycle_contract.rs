@@ -235,6 +235,7 @@ impl StateBuilder {
             } else {
                 active_work_unit
             },
+            episode_count: 0,
             budget: ResourceBudget::default(),
         };
 

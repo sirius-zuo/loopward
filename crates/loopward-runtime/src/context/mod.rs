@@ -60,9 +60,9 @@ use std::sync::Arc;
 
 use loopward_api::context::{
     BootPackageManifest, ContextBudget, ContextClass, ContextPriority, EstimateMethod, Fidelity,
-    Sensitivity, Validity, VerificationStatus,
+    ResourceGrant, ResourcePermission, Sensitivity, Validity, VerificationStatus,
 };
-use loopward_api::ids::EpisodeId;
+use loopward_api::ids::{EpisodeId, WorkUnitId};
 use loopward_api::resource::ResourceRef;
 use loopward_api::runner::RunnerCapabilities;
 use loopward_api::work_unit::WorkUnit;
@@ -73,6 +73,31 @@ use crate::ports::{ResourceBroker, ResourceError};
 pub use budget::{REFERENCE_ONLY_TOKENS, available_boot_tokens, heuristic_token_estimate};
 pub use hydrator::SelectionBucket;
 pub use manifest::{BOOT_PACKAGE_MANIFEST_SCHEMA_VERSION, checkpoint_ref_for};
+
+/// The [`ResourceGrant`]s a runner needs to actually fetch every
+/// [`Fidelity::ReferenceOnly`] item in `manifest` — the on-demand items the
+/// hydrator priced as cheap references on the promise that the runner can
+/// fetch them later (`docs/04-context-lifecycle.md` §6, the
+/// `supports_resource_fetch` capability). Without a matching grant, a
+/// runner honestly reporting that capability would be handed a manifest
+/// promising fetchable content it has no permission to actually fetch.
+#[must_use]
+pub fn resource_grants_for_manifest(
+    work_unit_id: WorkUnitId,
+    manifest: &BootPackageManifest,
+) -> Vec<ResourceGrant> {
+    manifest
+        .items
+        .iter()
+        .filter(|item| matches!(item.fidelity, Fidelity::ReferenceOnly))
+        .map(|item| ResourceGrant {
+            resource: item.source.clone(),
+            permissions: vec![ResourcePermission::Read],
+            scope: work_unit_id,
+            expires_at: None,
+        })
+        .collect()
+}
 
 /// The one `SHA-256` helper the crate shares, so a verification target
 /// binding and a Boot Package manifest are digested the same way.

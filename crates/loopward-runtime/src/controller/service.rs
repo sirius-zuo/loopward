@@ -177,6 +177,7 @@ impl loopward_api::loop_service::LoopService for RuntimeLoopService {
                 checkpoint_version: 1,
                 active_episode: None,
                 active_work_unit: None,
+                episode_count: 0,
                 budget: loopward_api::work_unit::ResourceBudget::default(),
             },
             episode: None,
@@ -538,10 +539,7 @@ fn project_status(state: &AggregateState, events: &[RecordedEvent]) -> LoopStatu
     };
     let active_episode = state.active_episode().map(|episode| EpisodeRef {
         episode_id: episode.id,
-        // `AggregateState` tracks only the *current* Episode, not a
-        // running ordinal across the Loop's lifetime; a dedicated counter
-        // is future work, so this is always reported as `0` for now.
-        ordinal: 0,
+        ordinal: state.execution.episode_count,
     });
     let active_work_unit = state
         .work_unit

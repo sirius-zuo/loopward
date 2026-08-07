@@ -22,6 +22,8 @@
 
 use std::collections::BTreeSet;
 
+use futures_util::future::try_join_all;
+
 use loopward_api::context::{
     BootPackageManifest, ContextClass, ContextItem, ContextPriority, EstimateMethod, Fidelity,
     Validity, VerificationStatus,
@@ -212,18 +214,31 @@ pub(crate) async fn hydrate(
     // Phase 1: required content. Resolved and digest-checked before anything
     // optional is even looked at, so a missing or divergent pinned resource
     // fails here.
+    let mut required: Vec<Ranked> = Vec::with_capacity(ranked.len());
+    let mut optional: Vec<Ranked> = Vec::new();
+    for entry in ranked {
+        if entry.bucket.is_required() {
+            required.push(entry);
+        } else {
+            optional.push(entry);
+        }
+    }
+
+    // Each required candidate's resolve is an independent broker read with
+    // no ordering dependency between them — `priced` is re-sorted by
+    // `selection_key` below regardless of resolution order — so resolving
+    // them concurrently rather than one `.await` at a time turns N
+    // sequential round trips into one wait.
+    let priced_required: Vec<(Priced, Vec<u8>)> = try_join_all(
+        required.iter().map(|entry| price_required(broker, entry)),
+    )
+    .await?;
+
     let mut priced: Vec<(Ranked, Result<Priced, ExclusionReason>)> =
-        Vec::with_capacity(ranked.len());
+        Vec::with_capacity(required.len() + optional.len());
     let mut pinned_bytes: Vec<(String, Vec<u8>)> = Vec::new();
     let mut required_tokens: u64 = 0;
-    let mut optional: Vec<Ranked> = Vec::new();
-
-    for entry in ranked {
-        if !entry.bucket.is_required() {
-            optional.push(entry);
-            continue;
-        }
-        let (cost, bytes) = price_required(broker, &entry).await?;
+    for (entry, (cost, bytes)) in required.into_iter().zip(priced_required) {
         required_tokens = required_tokens.saturating_add(cost.tokens);
         if entry.bucket == SelectionBucket::RequiredPinned {
             pinned_bytes.push((entry.candidate.id.clone(), bytes));

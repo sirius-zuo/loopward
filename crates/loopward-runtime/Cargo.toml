@@ -10,6 +10,7 @@ workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
+futures-util = { workspace = true }
 loopward-api = { path = "../loopward-api" }
 loopward-core = { path = "../loopward-core" }
 loopward-observability = { path = "../loopward-observability" }

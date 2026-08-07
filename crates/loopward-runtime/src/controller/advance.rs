@@ -96,7 +96,7 @@ use loopward_observability::spans::{
     Span, SpanContext, SpanLink, SpanLinkKind, SpanStart, span_name,
 };
 
-use crate::context::ContextCandidate;
+use crate::context::{ContextCandidate, resource_grants_for_manifest};
 use crate::ports::{
     AcquireLease, CheckpointCommitRequest, LoopLease, ResourceBeginHint, ResourceError,
     RuntimeInstanceId, RuntimePorts, StoreError,
@@ -898,6 +898,12 @@ impl LoopController {
             hard_context_budget,
             ..RotationContext::default()
         });
+        if !admission_decision.signals.is_empty() {
+            episode_span.set_end_attribute(
+                attribute::ROTATION_SIGNALS,
+                rotation_signals_label(&admission_decision.signals),
+            );
+        }
 
         if admission_decision.primary_reason == Some(RotationReason::HardContextBudget) {
             // The hard context budget stops admission before any model work
@@ -967,7 +973,10 @@ impl LoopController {
             attempt_id,
             idempotency_key,
             boot_package: report.manifest.clone(),
-            resource_grants: Vec::new(),
+            resource_grants: resource_grants_for_manifest(
+                work_unit.id,
+                &report.manifest,
+            ),
             output_contract: work_unit.output_contract.clone(),
             budget: work_unit.budget,
             deadline: None,
@@ -1757,4 +1766,22 @@ impl LoopController {
         let checkpoint = self.build_checkpoint(&state, episode_id);
         self.commit(loop_id, lease, &state, checkpoint, None).await
     }
+}
+
+/// A stable, comma-joined rendering of every signal a [`RotationDecision`]
+/// carried, highest-precedence first — e.g. `"work_unit_boundary(mandatory),soft_context_budget"`
+/// — for `attribute::ROTATION_SIGNALS`. Best-effort observability only, never
+/// parsed back into a `RotationReason` by anything durable.
+fn rotation_signals_label(signals: &[crate::rotation::RotationSignal]) -> String {
+    signals
+        .iter()
+        .map(|signal| {
+            if signal.mandatory {
+                format!("{}(mandatory)", signal.reason.label())
+            } else {
+                signal.reason.label().to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }

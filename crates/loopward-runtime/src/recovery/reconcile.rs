@@ -43,6 +43,7 @@ use loopward_core::{
 };
 
 use crate::HydrationRequest;
+use crate::context::resource_grants_for_manifest;
 use crate::controller::{ControllerError, OperationOutcome};
 use crate::ports::LoopLease;
 
@@ -124,9 +125,10 @@ impl RecoveryManager {
     }
 
     /// Resolves every resource an in-flight Episode currently references
-    /// (the hydrated Boot Package manifest, the Attempt's Boot Package, and
-    /// its collected result, when present) and suspends the Loop rather
-    /// than proceeding if any can no longer be resolved.
+    /// (the hydrated Boot Package manifest, the Session's boot manifest, the
+    /// Work Unit's declared inputs, the Attempt's Boot Package, and its
+    /// collected result, when present) and suspends the Loop rather than
+    /// proceeding if any can no longer be resolved.
     async fn check_resource_integrity(
         &self,
         loop_id: loopward_api::ids::LoopId,
@@ -138,6 +140,12 @@ impl RecoveryManager {
             && let Some(manifest_ref) = &episode.hydrated_manifest
         {
             refs.push(manifest_ref.clone());
+        }
+        if let Some(session) = &state.session {
+            refs.push(session.boot_manifest_ref.clone());
+        }
+        if let Some(work_unit) = &state.work_unit {
+            refs.extend(work_unit.inputs.iter().cloned());
         }
         if let Some(attempt) = &state.attempt {
             refs.push(attempt.boot_package_ref.clone());
@@ -464,21 +472,59 @@ impl RecoveryManager {
                     reason: SuspensionReason::Recovery,
                 })
             }
-            // `Failed`, `Cancelled`, `Unknown`, or the reconcile call itself
-            // failing: none of these can be safely distinguished from an
-            // unobservable external effect through this controller's
-            // current command surface (only `RequestRotation`'s
-            // runner-failure disposition reaches a documented `Ambiguous`
-            // edge from `Running`/`Prepared`), so all four take the
-            // conservative, already-reviewed mandatory-closure path a
-            // graceful in-process runner failure already uses. Known
-            // simplification: a *confirmed* `Failed`/`Cancelled` report is
-            // recorded as durably `Ambiguous` rather than a distinct
-            // terminal status Core has no command to produce from here.
-            Ok(
-                ReconcileOutcome::Failed | ReconcileOutcome::Cancelled | ReconcileOutcome::Unknown,
-            )
-            | Err(_) => {
+            Ok(ReconcileOutcome::Failed | ReconcileOutcome::Cancelled) => {
+                // Confirmed terminal: the external effect is over. Record
+                // the actual status *before* requesting rotation, so the
+                // reducer's `apply_rotation_requested` (whose `other =>
+                // other` arm preserves an already-terminal status) does not
+                // fall back to its conservative `Ambiguous` mapping for a
+                // pre-crash `Running`/`Prepared` attempt — that mapping
+                // exists for effects that genuinely cannot be observed,
+                // which this is not. `Failed`/`Cancelled` is not blocking
+                // for `require_reconciled_attempt`, so this self-heals on
+                // the next `recover()` the same way a dangling Attempt
+                // reconciled after Episode termination already does.
+                let confirmed_status = if matches!(reconciled, Ok(ReconcileOutcome::Cancelled)) {
+                    loopward_core::AttemptStatus::Cancelled
+                } else {
+                    loopward_core::AttemptStatus::Failed
+                };
+                let mut state = state;
+                if let Some(recorded) = state.attempt.as_mut()
+                    && recorded.id == attempt.id
+                {
+                    recorded.status = confirmed_status;
+                    recorded.result_ref = None;
+                }
+                let state = self
+                    .controller
+                    .apply(
+                        loop_id,
+                        lease,
+                        &state,
+                        LifecycleCommand::RequestRotation {
+                            reason: RotationReason::RunnerFailure,
+                        },
+                    )
+                    .await?;
+                self.controller
+                    .ensure_episode_terminal_and_commit(
+                        loop_id,
+                        lease,
+                        state,
+                        episode_id,
+                        SuspensionReason::Recovery,
+                    )
+                    .await?;
+                Ok(EpisodeRecoveryOutcome::Suspended {
+                    reason: SuspensionReason::Recovery,
+                })
+            }
+            // `Unknown`, or the reconcile call itself failing: neither
+            // confirms the external effect is over, so neither can be
+            // safely distinguished from an unobservable effect — this is
+            // the case the reducer's `Ambiguous` mapping exists for.
+            Ok(ReconcileOutcome::Unknown) | Err(_) => {
                 let state = self
                     .controller
                     .apply(
@@ -564,6 +610,8 @@ impl RecoveryManager {
             .resolve(&attempt.boot_package_ref)
             .await?;
         let boot_package: BootPackageManifest = serde_json::from_slice(&manifest_bytes)?;
+        let resource_grants =
+            resource_grants_for_manifest(work_unit.id, &boot_package).into_iter().collect();
 
         let request = WorkUnitRequest {
             protocol_version: loopward_api::PROTOCOL_VERSION.to_owned(),
@@ -575,7 +623,7 @@ impl RecoveryManager {
             attempt_id: attempt.id,
             idempotency_key: attempt.idempotency_key.clone(),
             boot_package,
-            resource_grants: Vec::new(),
+            resource_grants,
             output_contract: work_unit.output_contract.clone(),
             budget: work_unit.budget,
             deadline: None,

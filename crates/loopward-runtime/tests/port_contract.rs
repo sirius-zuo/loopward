@@ -460,6 +460,7 @@ fn genesis_state(loop_id: LoopId) -> AggregateState {
             checkpoint_version: 0,
             active_episode: None,
             active_work_unit: None,
+            episode_count: 0,
             budget: ResourceBudget::default(),
         },
         episode: None,
