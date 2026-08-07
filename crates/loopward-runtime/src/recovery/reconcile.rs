@@ -124,9 +124,10 @@ impl RecoveryManager {
     }
 
     /// Resolves every resource an in-flight Episode currently references
-    /// (the hydrated Boot Package manifest, the Attempt's Boot Package, and
-    /// its collected result, when present) and suspends the Loop rather
-    /// than proceeding if any can no longer be resolved.
+    /// (the hydrated Boot Package manifest, the Session's boot manifest, the
+    /// Work Unit's declared inputs, the Attempt's Boot Package, and its
+    /// collected result, when present) and suspends the Loop rather than
+    /// proceeding if any can no longer be resolved.
     async fn check_resource_integrity(
         &self,
         loop_id: loopward_api::ids::LoopId,
@@ -138,6 +139,12 @@ impl RecoveryManager {
             && let Some(manifest_ref) = &episode.hydrated_manifest
         {
             refs.push(manifest_ref.clone());
+        }
+        if let Some(session) = &state.session {
+            refs.push(session.boot_manifest_ref.clone());
+        }
+        if let Some(work_unit) = &state.work_unit {
+            refs.extend(work_unit.inputs.iter().cloned());
         }
         if let Some(attempt) = &state.attempt {
             refs.push(attempt.boot_package_ref.clone());
