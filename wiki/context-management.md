@@ -173,7 +173,15 @@ Before materializing payloads, the Context Manager represents candidates as `Con
 
 ## Spec Deviations
 
-Implementation has not been assessed.
+### PR #3's "grant on-demand resource_fetch access for reference-only items" fix closed a gap in the section 8 access-control mechanism
+
+- **Expected:** docs/04-context-lifecycle.md (section 8: Resource References and On-Demand Retrieval) requires on-demand retrieval to be scoped to the active Work Unit, auditable, and subject to access control, and names ResourceGrant as the type that carries that scope and permission.
+- **Implemented:** Before PR #3, the hydrator's price_optional (crates/loopward-runtime/src/context/hydrator.rs) already priced a candidate as Fidelity::ReferenceOnly whenever the bucket was OnDemandReference and the runner declared supports_resource_fetch, and that item reached the BootPackageManifest — but nothing in the runtime constructed a matching ResourceGrant for it, so a runner honestly declaring the capability had no permission to actually fetch the content the manifest promised. PR #3 added resource_grants_for_manifest (crates/loopward-runtime/src/context/mod.rs), which derives one ResourceGrant with ResourcePermission::Read, scoped to the Work Unit, for every Fidelity::ReferenceOnly item in a manifest, and wired its output into WorkUnitRequest's resource_grants field (crates/loopward-api/src/work_unit.rs) at both the primary boot call site (crates/loopward-runtime/src/controller/advance.rs) and the crash-recovery reconciliation call site (crates/loopward-runtime/src/recovery/reconcile.rs).
+- **Reason:** PR #3's body, commit list item 4, states the fix directly: "populate resource_grants with grants for every Fidelity::ReferenceOnly item." No design doc or PR body explains why PR #2's original hydrator omitted grant construction; observed current state is that the gap existed from PR #2 through PR #3.
+- **Impact:** Between PR #2 and PR #3, any runner declaring supports_resource_fetch that relied on a ReferenceOnly manifest item being fetchable would have had no valid grant to present to the Resource Broker, silently breaking the on-demand retrieval path section 8 requires — the manifest advertised fetchable references the runtime never authorized. The fix closes that gap for both fresh hydration and crash-recovery reconciliation.
+- **Status:** resolved.
+
+PR #3's companion perf change, "resolve required hydration candidates concurrently" (hydrate in crates/loopward-runtime/src/context/hydrator.rs, using try_join_all over price_required instead of one .await per candidate), is not a spec deviation. docs/04-context-lifecycle.md section 6 specifies the pipeline as an ordered sequence of selection stages, not a mandated resolution order for the individual required-candidate resource reads within the "select required context" stage, and the concurrently-resolved results are re-sorted by selection_key before assembly (assemble in the same file), so the manifest's item order, digests, and token totals are identical to the sequential form. No behavioral or determinism change results.
 
 ## Source Anchors
 
@@ -188,7 +196,14 @@ Implementation has not been assessed.
 
 ### Implementation Sources
 
-Implementation has not been assessed.
+- crates/loopward-runtime/src/context/mod.rs (module: ContextCandidate, HydrationRequest, HydrationReport, CandidateOutcome, ExclusionReason, CandidateDisposition, HydrationError, ContextHydrator with hydrate and hydrate_manifest, resource_grants_for_manifest)
+- crates/loopward-runtime/src/context/hydrator.rs (module: SelectionBucket and the deterministic pipeline function hydrate, plus project_candidates, rank, check_work_unit_constraints, price_required, price_optional, stale_exclusion, and assemble)
+- crates/loopward-runtime/src/context/budget.rs (module: available_boot_tokens, heuristic_token_estimate, BudgetLedger, REFERENCE_ONLY_TOKENS)
+- crates/loopward-runtime/src/context/manifest.rs (module: checkpoint_ref_for, content_digest, pinned_digest, seal, BOOT_PACKAGE_MANIFEST_SCHEMA_VERSION)
+- crates/loopward-api/src/context.rs (referenced not owned: the wire DTOs this page describes — ContextControlLevel, ContextCapabilities, ContextClass, ContextPriority, Fidelity, Sensitivity, Validity, EstimateMethod, ContextItem, ContextBudgetRequest, ContextBudget, BootPackageManifest, ResourcePermission, ResourceGrant, VerificationStatus, StateAssertionProposal, OpenIssueProposal, ObservationProposal, DecisionProposal, ContinuationProposal, and HandoffProposal)
+- crates/loopward-api/src/work_unit.rs (referenced not owned: WorkUnitRequest.resource_grants and WorkUnitRequest.boot_package, the fields a hydrated manifest and its resource grants are delivered through)
+- crates/loopward-runtime/src/controller/advance.rs (referenced not owned: the primary boot path call site that supplies resource_grants_for_manifest's output to a Work Unit Attempt request)
+- crates/loopward-runtime/src/recovery/reconcile.rs (referenced not owned: the crash-recovery reconciliation call site for resource_grants_for_manifest)
 
 ## Related Pages
 
