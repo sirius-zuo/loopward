@@ -62,10 +62,20 @@ pub use store::{SqliteLoopStore, SqliteStoreConfig, Synchronous};
 
 /// The Checkpoint schema version this adapter records against every stored
 /// Checkpoint, matching `docs/schemas/checkpoint-v0.1.yaml`.
+///
+/// Pinned to `loopward_core::Checkpoint`'s exact field set by
+/// `tests/schema_version_pinning.rs`'s
+/// `checkpoint_schema_version_matches_the_checkpoint_shape_it_names` — bump
+/// both together.
 pub const CHECKPOINT_SCHEMA_VERSION: &str = "loopward.checkpoint/v0.1";
 
 /// The Work Unit schema version this adapter records against every stored
 /// Work Unit, matching `docs/schemas/work-unit-v0.1.yaml`.
+///
+/// Pinned to `loopward_api::work_unit::WorkUnit`'s exact field set by
+/// `tests/schema_version_pinning.rs`'s
+/// `work_unit_schema_version_matches_the_work_unit_shape_it_names` — bump
+/// both together.
 pub const WORK_UNIT_SCHEMA_VERSION: &str = "loopward.work-unit/v0.1";
 
 /// The embedded, file-based schema migrations for this adapter.
