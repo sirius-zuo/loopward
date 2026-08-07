@@ -180,17 +180,15 @@ impl FileResourceBroker {
             .into());
         };
         let recorded: String = row.try_get(0).map_err(SqliteStoreError::from)?;
-        let digest = recorded
-            .strip_prefix("sha256:")
-            .ok_or_else(|| {
-                SqliteStoreError::resource_io(
-                    pending_path,
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "pending buffer vanished before its digest was recorded",
-                    ),
-                )
-            })?;
+        let digest = recorded.strip_prefix("sha256:").ok_or_else(|| {
+            SqliteStoreError::resource_io(
+                pending_path,
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "pending buffer vanished before its digest was recorded",
+                ),
+            )
+        })?;
         let content_path = self.content_path(digest);
         let size = std::fs::metadata(&content_path)
             .map_err(|source| SqliteStoreError::resource_io(&content_path, source))?
@@ -394,7 +392,9 @@ mod tests {
             ))
             .await
             .expect("pool opens");
-        crate::run_migrations(&pool).await.expect("migrations apply");
+        crate::run_migrations(&pool)
+            .await
+            .expect("migrations apply");
         let broker = FileResourceBroker::new(pool, directory.path().join("resources"))
             .expect("broker opens");
         (broker, directory)

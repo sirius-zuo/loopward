@@ -229,10 +229,8 @@ pub(crate) async fn hydrate(
     // `selection_key` below regardless of resolution order — so resolving
     // them concurrently rather than one `.await` at a time turns N
     // sequential round trips into one wait.
-    let priced_required: Vec<(Priced, Vec<u8>)> = try_join_all(
-        required.iter().map(|entry| price_required(broker, entry)),
-    )
-    .await?;
+    let priced_required: Vec<(Priced, Vec<u8>)> =
+        try_join_all(required.iter().map(|entry| price_required(broker, entry))).await?;
 
     let mut priced: Vec<(Ranked, Result<Priced, ExclusionReason>)> =
         Vec::with_capacity(required.len() + optional.len());

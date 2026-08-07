@@ -56,8 +56,7 @@ fn field_names_of<T: serde::Serialize>(sample: &T) -> BTreeSet<String> {
 #[test]
 fn checkpoint_schema_version_matches_the_checkpoint_shape_it_names() {
     assert_eq!(
-        CHECKPOINT_SCHEMA_VERSION,
-        "loopward.checkpoint/v0.1",
+        CHECKPOINT_SCHEMA_VERSION, "loopward.checkpoint/v0.1",
         "bump this test's expected version alongside the constant"
     );
     let sample = Checkpoint {
@@ -86,8 +85,7 @@ fn checkpoint_schema_version_matches_the_checkpoint_shape_it_names() {
 #[test]
 fn work_unit_schema_version_matches_the_work_unit_shape_it_names() {
     assert_eq!(
-        WORK_UNIT_SCHEMA_VERSION,
-        "loopward.work-unit/v0.1",
+        WORK_UNIT_SCHEMA_VERSION, "loopward.work-unit/v0.1",
         "bump this test's expected version alongside the constant"
     );
     let sample = WorkUnit {
