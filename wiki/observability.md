@@ -143,7 +143,6 @@ Events, metrics, and logs are complementary views of lifecycle telemetry. Signif
 - **Sampling:** External policies should preserve errors, ambiguity, suspension, recovery, and rotation anomalies when supported.
 - **Testing:** Phase One uses an in-memory span exporter or recorder, deterministic clocks and identifiers, assertions on names, attributes, links, and redaction, plus failure injection around runner, verification, and Checkpoint operations.
 - **Evaluation:** Trace continuity is measured as Episodes correctly linked through Checkpoints; unavailable telemetry remains unavailable rather than estimated without attribution.
-- **Specification status:** The observability documents are drafts for review; implementation has not been assessed.
 
 ## Spec Deviations
 
