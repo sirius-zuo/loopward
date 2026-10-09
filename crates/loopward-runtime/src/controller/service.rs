@@ -198,7 +198,10 @@ impl loopward_api::loop_service::LoopService for RuntimeLoopService {
         // *not* present. The lease is acquired only once the Loop is
         // durable, immediately after — closing the window a caller with
         // knowledge of `loop_id` could otherwise use to write with the
-        // still-current token `0`.
+        // still-current token `0`. Its only job is that token bump, so it is
+        // handed straight back: release keeps the token, so `0` stays stale
+        // while the next command — typically a separate CLI process with its
+        // own runtime instance identity — can acquire the Loop at once.
         let stored = ports
             .store
             .commit_checkpoint(crate::ports::CheckpointCommitRequest {
@@ -213,7 +216,7 @@ impl loopward_api::loop_service::LoopService for RuntimeLoopService {
             .await
             .map_err(|error| store_error(&error))?;
 
-        ports
+        let lease = ports
             .store
             .acquire_lease(crate::ports::AcquireLease {
                 loop_id,
@@ -222,6 +225,7 @@ impl loopward_api::loop_service::LoopService for RuntimeLoopService {
             })
             .await
             .map_err(|error| store_error(&error))?;
+        self.controller.release_lease(&lease).await;
 
         let handle = LoopHandle {
             loop_id,

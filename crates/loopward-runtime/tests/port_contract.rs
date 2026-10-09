@@ -443,6 +443,18 @@ impl LoopStore for InMemoryLoopStore {
         leases.insert(lease.loop_id, renewed);
         Ok(renewed)
     }
+
+    async fn release_lease(&self, lease: &LoopLease) -> Result<(), StoreError> {
+        // Only the current lease is released; `fencing_tokens` is kept
+        // separately, so the next acquisition still increments the token.
+        let mut leases = self.leases.lock().expect("leases lock poisoned");
+        if leases.get(&lease.loop_id).is_some_and(|held| {
+            held.holder_id == lease.holder_id && held.fencing_token == lease.fencing_token
+        }) {
+            leases.remove(&lease.loop_id);
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -878,6 +890,102 @@ async fn lease_conflict_when_another_holder_still_holds_the_lease() {
         .await
         .expect("same holder can re-acquire");
     assert_eq!(reacquired.fencing_token, 2);
+}
+
+#[tokio::test]
+async fn a_released_lease_frees_the_loop_but_its_token_never_writes_again() {
+    let (ports, loop_id, _fixed_now) = build_ports();
+
+    let released = ports
+        .store
+        .acquire_lease(AcquireLease {
+            loop_id,
+            holder_id: RuntimeInstanceId::new(),
+            ttl: time::Duration::seconds(30),
+        })
+        .await
+        .expect("first acquisition succeeds");
+    ports
+        .store
+        .release_lease(&released)
+        .await
+        .expect("release succeeds");
+    // Releasing twice is harmless.
+    ports
+        .store
+        .release_lease(&released)
+        .await
+        .expect("a repeated release succeeds");
+
+    // A different holder no longer has to wait for the TTL, and taking
+    // over still increments the fencing token (§7).
+    let taken_over = ports
+        .store
+        .acquire_lease(AcquireLease {
+            loop_id,
+            holder_id: RuntimeInstanceId::new(),
+            ttl: time::Duration::seconds(30),
+        })
+        .await
+        .expect("another holder acquires a released lease");
+    assert_eq!(taken_over.fencing_token, released.fencing_token + 1);
+
+    // The released lease's token is stale: it can never write again.
+    let stale_result = ports
+        .store
+        .append(
+            loop_id,
+            0,
+            released.fencing_token,
+            vec![LoopEvent::LoopCompleted],
+        )
+        .await;
+    assert!(matches!(
+        stale_result,
+        Err(StoreError::StaleFencingToken { .. })
+    ));
+}
+
+#[tokio::test]
+async fn releasing_a_superseded_lease_leaves_the_current_one_held() {
+    let (ports, loop_id, _fixed_now) = build_ports();
+
+    let holder = RuntimeInstanceId::new();
+    let superseded = ports
+        .store
+        .acquire_lease(AcquireLease {
+            loop_id,
+            holder_id: holder,
+            ttl: time::Duration::seconds(30),
+        })
+        .await
+        .expect("first acquisition succeeds");
+    let current = ports
+        .store
+        .acquire_lease(AcquireLease {
+            loop_id,
+            holder_id: holder,
+            ttl: time::Duration::seconds(30),
+        })
+        .await
+        .expect("same holder reacquires");
+    assert!(current.fencing_token > superseded.fencing_token);
+
+    // Releasing the old lease must not cut the current one short.
+    ports
+        .store
+        .release_lease(&superseded)
+        .await
+        .expect("releasing a superseded lease is a no-op");
+    let conflict = ports
+        .store
+        .acquire_lease(AcquireLease {
+            loop_id,
+            holder_id: RuntimeInstanceId::new(),
+            ttl: time::Duration::seconds(30),
+        })
+        .await;
+    assert!(matches!(conflict, Err(StoreError::LeaseConflict(id)) if id == loop_id));
 }
 
 #[tokio::test]

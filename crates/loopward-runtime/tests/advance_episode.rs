@@ -448,6 +448,18 @@ impl LoopStore for InMemoryLoopStore {
         leases.insert(lease.loop_id, renewed);
         Ok(renewed)
     }
+
+    async fn release_lease(&self, lease: &LoopLease) -> Result<(), StoreError> {
+        // Only the current lease is released; `fencing_tokens` is kept
+        // separately, so the next acquisition still increments the token.
+        let mut leases = self.leases.lock().expect("leases lock poisoned");
+        if leases.get(&lease.loop_id).is_some_and(|held| {
+            held.holder_id == lease.holder_id && held.fencing_token == lease.fencing_token
+        }) {
+            leases.remove(&lease.loop_id);
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1540,4 +1552,133 @@ async fn runner_collect_failure_suspends_the_loop_and_commits() {
         rotation_reason,
         Some(loopward_core::RotationReason::RunnerFailure)
     );
+}
+
+// ---------------------------------------------------------------------------
+// Lease hand-back (`docs/03-durable-state-and-transactions.md` §7)
+// ---------------------------------------------------------------------------
+
+/// Builds a controller over `ports` with its own, freshly minted runtime
+/// instance identity — as a separate `loopward` CLI process would.
+fn another_runtime_instance(
+    ports: &RuntimePorts,
+    broker: &Arc<InMemoryResourceBroker>,
+) -> LoopController {
+    LoopController::new(
+        ports.clone(),
+        Arc::new(FakeRunner::new(Arc::clone(broker))) as Arc<dyn WorkUnitRunner>,
+        Arc::new(AlwaysAcceptPlan),
+    )
+    .with_default_budget(generous_budget())
+}
+
+/// Every lease-acquiring `LoopController` operation hands its lease back
+/// when it returns, so a *different* runtime instance can drive the same
+/// Loop straight afterwards instead of being refused `LeaseConflict` until
+/// the TTL runs out. (`InMemoryLoopStore` does not model TTL expiry at all,
+/// so without the hand-back the second instance would be refused forever.)
+#[tokio::test]
+async fn a_different_runtime_instance_can_drive_a_loop_right_after_each_operation() {
+    let work_unit = test_work_unit(WorkUnitId::new(), Vec::new(), Vec::new());
+    let (ports, loop_id, broker) = build_ports(Some(work_unit));
+    let first = another_runtime_instance(&ports, &broker);
+    let second = another_runtime_instance(&ports, &broker);
+    assert_ne!(first.holder_id(), second.holder_id());
+
+    first
+        .advance(loop_id)
+        .await
+        .expect("first instance advances");
+    second
+        .advance(loop_id)
+        .await
+        .expect("second instance advances right after the first");
+    first
+        .suspend(loop_id, SuspensionReason::OperatorRequest)
+        .await
+        .expect("first instance suspends right after the second");
+    second
+        .resume(loop_id)
+        .await
+        .expect("second instance resumes right after the first");
+    first
+        .cancel(loop_id)
+        .await
+        .expect("first instance cancels right after the second");
+
+    let stored = ports.store.load(loop_id).await.expect("load succeeds");
+    assert_eq!(stored.state.execution.status, LoopStatus::Cancelled);
+}
+
+/// An operation that fails after acquiring its lease still hands it back:
+/// the next runtime instance sees the same domain failure, not a lease
+/// conflict.
+#[tokio::test]
+async fn a_failed_operation_still_hands_its_lease_back() {
+    let (ports, loop_id, broker) = build_ports(None);
+    let first = another_runtime_instance(&ports, &broker);
+    let second = another_runtime_instance(&ports, &broker);
+
+    let result = first.advance(loop_id).await;
+    assert!(matches!(result, Err(ControllerError::NoWorkUnit(id)) if id == loop_id));
+
+    let result = second.advance(loop_id).await;
+    assert!(
+        matches!(result, Err(ControllerError::NoWorkUnit(id)) if id == loop_id),
+        "expected NoWorkUnit, got {result:?}"
+    );
+}
+
+/// `RuntimeLoopService::create` and `resume` (which runs recovery under its
+/// own lease acquisition) hand their leases back too.
+#[tokio::test]
+async fn runtime_loop_service_operations_hand_their_leases_back() {
+    let (ports, _seeded_loop_id, broker) = build_ports(None);
+    let service = RuntimeLoopService::new(another_runtime_instance(&ports, &broker));
+    let other = another_runtime_instance(&ports, &broker);
+    let metadata = |key: &str, expected_revision: Option<u64>| CommandMetadata {
+        request_id: format!("req-{key}"),
+        idempotency_key: key.to_owned(),
+        expected_revision,
+        principal: None,
+        trace_context: TraceContext::default(),
+    };
+
+    let handle = service
+        .create(CreateLoopRequest {
+            metadata: metadata("create", None),
+            protocol_version: loopward_api::PROTOCOL_VERSION.to_owned(),
+            kind: LoopKind::new("domain.example"),
+            goal: Goal {
+                statement: "hand leases back".to_owned(),
+            },
+            success_criteria: Vec::new(),
+            pinned_constraints: Vec::new(),
+            domain_schema: SchemaRef::new("loopward.test-domain/v0.1"),
+            initial_domain_state: serde_json::Value::Null,
+            policies: LoopPolicies::default(),
+        })
+        .await
+        .expect("create succeeds");
+    let loop_id = handle.loop_id;
+
+    other
+        .suspend(loop_id, SuspensionReason::OperatorRequest)
+        .await
+        .expect("another instance suspends right after create");
+
+    service
+        .resume(loopward_api::loop_service::ResumeLoopCommand {
+            metadata: metadata("resume", None),
+            loop_id,
+        })
+        .await
+        .expect("service resumes right after another instance suspended");
+
+    other
+        .cancel(loop_id)
+        .await
+        .expect("another instance cancels right after the service resumed");
+    let stored = ports.store.load(loop_id).await.expect("load succeeds");
+    assert_eq!(stored.state.execution.status, LoopStatus::Cancelled);
 }

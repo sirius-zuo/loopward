@@ -732,6 +732,112 @@ async fn a_reacquired_lease_has_a_larger_fencing_token() {
 }
 
 #[tokio::test]
+async fn a_released_lease_frees_the_loop_but_its_token_never_writes_again() {
+    let harness = Harness::open().await;
+    let loop_id = LoopId::new();
+    commit_genesis(&harness, loop_id).await;
+
+    let released = harness
+        .store
+        .acquire_lease(AcquireLease {
+            loop_id,
+            holder_id: RuntimeInstanceId::new(),
+            ttl: time::Duration::seconds(30),
+        })
+        .await
+        .expect("first acquisition succeeds");
+    harness
+        .store
+        .release_lease(&released)
+        .await
+        .expect("release succeeds");
+    // Releasing twice is harmless.
+    harness
+        .store
+        .release_lease(&released)
+        .await
+        .expect("a repeated release succeeds");
+
+    // A different runtime instance no longer has to wait out the 30s TTL,
+    // and taking over still increments the fencing token (§7) — release
+    // keeps the lease row rather than resetting the token to `0`.
+    let taken_over = harness
+        .store
+        .acquire_lease(AcquireLease {
+            loop_id,
+            holder_id: RuntimeInstanceId::new(),
+            ttl: time::Duration::seconds(30),
+        })
+        .await
+        .expect("another holder acquires a released lease");
+    assert_eq!(taken_over.fencing_token, released.fencing_token + 1);
+
+    // The released lease's token is stale: it can never write again.
+    let result = harness
+        .store
+        .append(
+            loop_id,
+            1,
+            released.fencing_token,
+            vec![LoopEvent::LoopCompleted],
+        )
+        .await;
+    assert!(matches!(result, Err(StoreError::StaleFencingToken { .. })));
+    assert_eq!(harness.event_sequences(loop_id).await, vec![1]);
+}
+
+#[tokio::test]
+async fn releasing_a_superseded_lease_leaves_the_current_one_held() {
+    let harness = Harness::open().await;
+    let loop_id = LoopId::new();
+    commit_genesis(&harness, loop_id).await;
+
+    let holder = RuntimeInstanceId::new();
+    let superseded = harness
+        .store
+        .acquire_lease(AcquireLease {
+            loop_id,
+            holder_id: holder,
+            ttl: time::Duration::seconds(30),
+        })
+        .await
+        .expect("first acquisition succeeds");
+    let current = harness
+        .store
+        .acquire_lease(AcquireLease {
+            loop_id,
+            holder_id: holder,
+            ttl: time::Duration::seconds(30),
+        })
+        .await
+        .expect("same holder reacquires");
+    assert!(current.fencing_token > superseded.fencing_token);
+
+    // Releasing the old lease must not cut the current one short.
+    harness
+        .store
+        .release_lease(&superseded)
+        .await
+        .expect("releasing a superseded lease is a no-op");
+    let conflict = harness
+        .store
+        .acquire_lease(AcquireLease {
+            loop_id,
+            holder_id: RuntimeInstanceId::new(),
+            ttl: time::Duration::seconds(30),
+        })
+        .await;
+    assert!(matches!(conflict, Err(StoreError::LeaseConflict(id)) if id == loop_id));
+
+    // ...and the current holder can still renew it.
+    harness
+        .store
+        .renew_lease(&current)
+        .await
+        .expect("the current lease is still held");
+}
+
+#[tokio::test]
 async fn renewing_a_lease_that_was_never_acquired_is_rejected() {
     let harness = Harness::open().await;
     let loop_id = LoopId::new();
