@@ -1,4 +1,4 @@
-//! Lease acquisition, renewal, and the fencing token every write is
+//! Lease acquisition, renewal, release, and the fencing token every write is
 //! validated against (`docs/03-durable-state-and-transactions.md` §7).
 //!
 //! At most one driver may mutate a Loop. Reacquisition — by a different
@@ -192,6 +192,49 @@ pub(crate) async fn renew_in_transaction(
         return Err(StoreError::LeaseNotHeld(lease.loop_id));
     }
     Ok(renewed)
+}
+
+/// Hands a held lease back early by expiring it as of `now`.
+///
+/// The row stays, and with it the fencing token: deleting it would make
+/// [`current_fencing_token`] fall back to `0` and let the next acquisition
+/// hand out token `1` again. Expiring it instead means the next
+/// acquisition, by any holder, takes the ordinary "expired lease" path in
+/// [`acquire_in_transaction`] and still increments the token.
+///
+/// Only the current lease is expired — this holder, this fencing token, not
+/// yet expired — so releasing a superseded or already-released lease is a
+/// no-op rather than an error, and can never cut short a later
+/// acquisition's lease. Runs inside the caller's `BEGIN IMMEDIATE`
+/// transaction, so the check and the write cannot be split by a concurrent
+/// acquisition.
+pub(crate) async fn release_in_transaction(
+    connection: &mut SqliteConnection,
+    lease: &LoopLease,
+    now: Timestamp,
+) -> Result<(), StoreError> {
+    let Some(held) = read_lease(connection, lease.loop_id).await? else {
+        return Ok(());
+    };
+    if held.holder_id != lease.holder_id
+        || held.fencing_token != lease.fencing_token
+        || held.expires_at <= now
+    {
+        return Ok(());
+    }
+
+    sqlx::query(
+        "UPDATE loop_leases SET expires_at = ?1 \
+         WHERE loop_id = ?2 AND holder_id = ?3 AND fencing_token = ?4",
+    )
+    .bind(format_timestamp(now).map_err(StoreError::from)?)
+    .bind(lease.loop_id.to_string())
+    .bind(lease.holder_id.to_string())
+    .bind(sql_i64("fencing token", lease.fencing_token).map_err(StoreError::from)?)
+    .execute(connection)
+    .await
+    .map_err(SqliteStoreError::from)?;
+    Ok(())
 }
 
 /// Whether a durable Loop row exists.

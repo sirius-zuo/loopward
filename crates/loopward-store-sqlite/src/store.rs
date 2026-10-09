@@ -315,6 +315,13 @@ impl LoopStore for SqliteLoopStore {
         let outcome = lease::renew_in_transaction(&mut transaction, lease, now).await;
         finish(transaction, outcome).await
     }
+
+    async fn release_lease(&self, lease: &LoopLease) -> Result<(), StoreError> {
+        let now = Timestamp::now_utc();
+        let mut transaction = self.begin().await?;
+        let outcome = lease::release_in_transaction(&mut transaction, lease, now).await;
+        finish(transaction, outcome).await
+    }
 }
 
 /// Commits `outcome`'s transaction on success, and rolls it back — before

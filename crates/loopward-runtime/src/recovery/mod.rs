@@ -70,7 +70,7 @@ use loopward_observability::spans::{Span, SpanLink, SpanLinkKind, SpanStart, spa
 
 use crate::HydrationRequest;
 use crate::controller::{ControllerError, LoopController};
-use crate::ports::{AcquireLease, CheckpointCommitRequest, LoopLease};
+use crate::ports::{CheckpointCommitRequest, LoopLease};
 
 pub use reconcile::EpisodeRecoveryOutcome;
 
@@ -186,17 +186,18 @@ impl RecoveryManager {
     /// the lease was lost (`docs/10-mvp-and-evaluation.md` §8, Step 5) — and
     /// otherwise anything the reused controller helpers can return.
     pub async fn recover(&self, loop_id: LoopId) -> Result<RecoveryOutcome, ControllerError> {
-        let lease = self
-            .controller
-            .ports()
-            .store
-            .acquire_lease(AcquireLease {
-                loop_id,
-                holder_id: self.controller.holder_id(),
-                ttl: self.controller.lease_ttl(),
-            })
-            .await?;
+        self.controller
+            .with_lease(loop_id, |lease| self.recover_under(loop_id, lease))
+            .await
+    }
 
+    /// [`Self::recover`]'s body, run under the lease that method acquires
+    /// and hands back.
+    async fn recover_under(
+        &self,
+        loop_id: LoopId,
+        lease: LoopLease,
+    ) -> Result<RecoveryOutcome, ControllerError> {
         let stored = self.controller.ports().store.load(loop_id).await?;
         let state = stored.state;
 

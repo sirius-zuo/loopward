@@ -16,6 +16,7 @@
 //! → verify
 //! → commit Checkpoint
 //! → close Session and Episode
+//! → release lease
 //! ```
 //!
 //! Every external effect (hydration resolving resources, spawning the
@@ -400,7 +401,7 @@ impl LoopController {
         self
     }
 
-    /// Overrides the lease TTL acquired for each `advance` call.
+    /// Overrides the lease TTL acquired for each lease-holding operation.
     #[must_use]
     pub fn with_lease_ttl(mut self, ttl: time::Duration) -> Self {
         self.lease_ttl = ttl;
@@ -439,6 +440,50 @@ impl LoopController {
     #[must_use]
     pub fn holder_id(&self) -> RuntimeInstanceId {
         self.holder_id
+    }
+
+    /// Runs `operation` under a freshly acquired lease on `loop_id`, then
+    /// hands that lease back whether `operation` succeeded or not
+    /// (`docs/03-durable-state-and-transactions.md` §7).
+    ///
+    /// Holding the lease only for the span of one operation is what lets a
+    /// different runtime instance — notably the next one-shot `loopward`
+    /// CLI process, which mints its own [`RuntimeInstanceId`] — drive the
+    /// Loop as soon as this call returns, instead of being refused until the
+    /// TTL runs out. Mutual exclusion while the operation is running is
+    /// unchanged, and a process that dies mid-operation never reaches the
+    /// release, so its lease still expires on its own exactly as before.
+    pub(crate) async fn with_lease<T, F, Fut>(
+        &self,
+        loop_id: LoopId,
+        operation: F,
+    ) -> Result<T, ControllerError>
+    where
+        F: FnOnce(LoopLease) -> Fut,
+        Fut: Future<Output = Result<T, ControllerError>>,
+    {
+        let lease = self
+            .ports
+            .store
+            .acquire_lease(AcquireLease {
+                loop_id,
+                holder_id: self.holder_id,
+                ttl: self.lease_ttl,
+            })
+            .await?;
+        let outcome = operation(lease).await;
+        self.release_lease(&lease).await;
+        outcome
+    }
+
+    /// Hands `lease` back, best-effort.
+    ///
+    /// A failed release is deliberately not reported: the operation that
+    /// held the lease has already committed (or failed) on its own terms,
+    /// fencing — not release — is what stops a stale holder from writing,
+    /// and an unreleased lease simply expires at the end of its TTL.
+    pub(crate) async fn release_lease(&self, lease: &LoopLease) {
+        let _ = self.ports.store.release_lease(lease).await;
     }
 
     /// The runner this controller invokes Work Unit Attempts through.
@@ -493,15 +538,18 @@ impl LoopController {
         loop_id: LoopId,
         reason: SuspensionReason,
     ) -> Result<(), ControllerError> {
-        let lease = self
-            .ports
-            .store
-            .acquire_lease(AcquireLease {
-                loop_id,
-                holder_id: self.holder_id,
-                ttl: self.lease_ttl,
-            })
-            .await?;
+        self.with_lease(loop_id, |lease| self.suspend_under(loop_id, lease, reason))
+            .await
+    }
+
+    /// [`Self::suspend`]'s body, run under the lease that method acquires and
+    /// hands back.
+    async fn suspend_under(
+        &self,
+        loop_id: LoopId,
+        lease: LoopLease,
+        reason: SuspensionReason,
+    ) -> Result<(), ControllerError> {
         let stored = self.ports.store.load(loop_id).await?;
         let state = stored.state;
         if state.execution.status.is_terminal() || state.execution.status == LoopStatus::Suspended {
@@ -556,15 +604,13 @@ impl LoopController {
     /// store rejects the write, or the resulting state fails invariant
     /// validation.
     pub async fn resume(&self, loop_id: LoopId) -> Result<(), ControllerError> {
-        let lease = self
-            .ports
-            .store
-            .acquire_lease(AcquireLease {
-                loop_id,
-                holder_id: self.holder_id,
-                ttl: self.lease_ttl,
-            })
-            .await?;
+        self.with_lease(loop_id, |lease| self.resume_under(loop_id, lease))
+            .await
+    }
+
+    /// [`Self::resume`]'s body, run under the lease that method acquires and
+    /// hands back.
+    async fn resume_under(&self, loop_id: LoopId, lease: LoopLease) -> Result<(), ControllerError> {
         let stored = self.ports.store.load(loop_id).await?;
         let mut state = stored.state;
         if state.execution.status != LoopStatus::Suspended {
@@ -626,15 +672,13 @@ impl LoopController {
     /// still live, and otherwise whatever [`Self::resume`] can return for
     /// the same category of failure.
     pub async fn cancel(&self, loop_id: LoopId) -> Result<(), ControllerError> {
-        let lease = self
-            .ports
-            .store
-            .acquire_lease(AcquireLease {
-                loop_id,
-                holder_id: self.holder_id,
-                ttl: self.lease_ttl,
-            })
-            .await?;
+        self.with_lease(loop_id, |lease| self.cancel_under(loop_id, lease))
+            .await
+    }
+
+    /// [`Self::cancel`]'s body, run under the lease that method acquires and
+    /// hands back.
+    async fn cancel_under(&self, loop_id: LoopId, lease: LoopLease) -> Result<(), ControllerError> {
         let stored = self.ports.store.load(loop_id).await?;
         let mut state = stored.state;
         if state.execution.status.is_terminal() {
@@ -692,16 +736,17 @@ impl LoopController {
     /// [`OperationOutcome::Suspended`] with a committed Checkpoint recording
     /// the best-known durable state.
     pub async fn advance(&self, loop_id: LoopId) -> Result<OperationOutcome, ControllerError> {
-        let lease = self
-            .ports
-            .store
-            .acquire_lease(AcquireLease {
-                loop_id,
-                holder_id: self.holder_id,
-                ttl: self.lease_ttl,
-            })
-            .await?;
+        self.with_lease(loop_id, |lease| self.advance_under(loop_id, lease))
+            .await
+    }
 
+    /// [`Self::advance`]'s body, run under the lease that method acquires and
+    /// hands back.
+    async fn advance_under(
+        &self,
+        loop_id: LoopId,
+        lease: LoopLease,
+    ) -> Result<OperationOutcome, ControllerError> {
         let stored = self.ports.store.load(loop_id).await?;
         let state = stored.state;
 

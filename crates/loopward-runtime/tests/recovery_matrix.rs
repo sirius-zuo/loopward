@@ -455,6 +455,18 @@ impl LoopStore for InMemoryLoopStore {
         leases.insert(lease.loop_id, renewed);
         Ok(renewed)
     }
+
+    async fn release_lease(&self, lease: &LoopLease) -> Result<(), StoreError> {
+        // Only the current lease is released; `fencing_tokens` is kept
+        // separately, so the next acquisition still increments the token.
+        let mut leases = self.leases.lock().expect("leases lock poisoned");
+        if leases.get(&lease.loop_id).is_some_and(|held| {
+            held.holder_id == lease.holder_id && held.fencing_token == lease.fencing_token
+        }) {
+            leases.remove(&lease.loop_id);
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------

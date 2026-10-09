@@ -369,44 +369,56 @@ necessary or made.
 
 ## 10. Known Phase One limitations (deviations)
 
-Two accepted, narrow scope limitations were confirmed while addressing the
-final whole-branch review's fix round. Neither is a bug; both are
-deliberate Phase One scope boundaries, recorded here explicitly rather than
-left as silent gaps.
+Two narrow scope limitations were recorded while addressing the final
+whole-branch review's fix round. §10.2 remains an accepted, deliberate
+Phase One scope boundary. §10.1 was originally accepted the same way but
+has since been fixed: in practice it made every mutating CLI command fail
+when run within `--lease-seconds` of the previous one. It is kept below,
+marked resolved, so the record of the original decision is not lost.
 
-### 10.1 No `release_lease` mechanism; `create` immediately followed by a separate CLI invocation deterministically fails `lease_unavailable`
+### 10.1 Resolved: leases are now handed back after each operation
 
-No `release_lease` method (or equivalent) exists anywhere in the
-`LoopStore` trait or any of its implementations
-(`crates/loopward-store-sqlite`, the in-memory test doubles). Combined with
-the CLI's one-process-per-invocation model (`LoopController::new` mints a
-fresh, randomly generated `RuntimeInstanceId` every time the `loopward`
-binary starts) and the default 60-second lease TTL
-(`DEFAULT_LEASE_SECONDS`), running `loopward create` and then, as a
-*separate* process invocation, `loopward advance` (or `run`, `suspend`,
-`resume`, `cancel`) deterministically fails with `lease_unavailable` until
-either the `create` invocation's lease naturally expires or a shorter
-`--lease-seconds` is explicitly configured.
+**Originally recorded limitation.** No `release_lease` method existed on
+`LoopStore`, so every lease-acquiring operation (`create`, `advance`,
+`run`, `suspend`, `resume`, `cancel`, recovery) left its lease held until
+the TTL ran out. Combined with the CLI's one-process-per-invocation model
+(`LoopController::new` mints a fresh `RuntimeInstanceId` every time the
+`loopward` binary starts) and the default 60-second `--lease-seconds`, any
+mutating command run as a separate invocation within 60 seconds of the
+previous one failed with `lease_unavailable` — for example `loopward
+create` followed straight away by `loopward suspend`. `cli_contract.rs`
+asserted this as expected behaviour, and its lifecycle test slept past a
+shortened TTL between commands to work around it.
 
-This is exercised and asserted as expected, working-as-shipped behavior —
-not a defect — by `crates/loopward-cli/tests/cli_contract.rs`'s
-`advance_and_run_conflict_with_the_lease_create_still_holds` test, which
-drives exactly this sequence and asserts a clean `lease_unavailable`
-failure (never a panic, never a silent hang) on the very next
-lease-acquiring command.
+**Fix.** Leases now cover one operation each, as `docs/03` §7 and
+`docs/07` §12 ("before releasing the execution lease") intend:
 
-A future daemon/service mode that keeps a single long-lived
-`LoopController`/`RuntimeInstanceId` alive across what are today separate
-CLI invocations would not hit this at all (the same instance can simply
-reacquire its own unexpired lease). Absent that, closing this gap for the
-current one-shot-per-process CLI would need either a `release_lease` port
-method on `LoopStore`, or a caller-supplied stable holder identity shared
-across invocations (so a later invocation is recognized as the same
-holder rather than a competing one) — both are new scope, not implemented
-in Phase One, and deliberately not added as part of this fix round: adding
-`release_lease` this late would touch `LoopStore`'s trait contract and the
-recovery invariants built on top of lease fencing, for a documentation gap
-rather than a demonstrated correctness bug.
+- `LoopStore::release_lease` hands a lease back early. The SQLite adapter
+  (`loopward-store-sqlite/src/lease.rs`, `release_in_transaction`) expires
+  the lease row instead of deleting it, so the fencing token is kept: the
+  next acquisition, by any holder, still increments it, and the released
+  lease can never write again. Releasing a lease that is no longer current
+  (already released, expired, or superseded) is a no-op, so release can
+  never cut short another holder's lease.
+- `LoopController::with_lease` acquires the lease, runs one operation, and
+  hands the lease back whether the operation succeeded or failed.
+  `advance`, `suspend`, `resume`, `cancel`, and `RecoveryManager::recover`
+  all run through it. `RuntimeLoopService::create` hands back the lease it
+  takes only to supersede the genesis fencing token `0`. A process that
+  dies mid-operation never reaches the release, so its lease still expires
+  on the TTL as before.
+- A stable holder identity shared across CLI invocations was considered
+  and rejected. It would let a second, concurrent CLI process silently
+  reacquire a live `run`'s lease and fence it out, which breaks §7's "at
+  most one driver may mutate a Loop."
+
+Regression coverage: `cli_contract.rs`'s
+`mutating_commands_chain_across_separate_invocations` and
+`advance_and_run_right_after_create_are_not_blocked_by_its_lease`;
+`advance_episode.rs`'s lease hand-back tests across two runtime
+instances; and `release_lease` contract tests for both the SQLite store
+(`transaction_contract.rs`) and the in-memory port fake
+(`port_contract.rs`).
 
 ### 10.2 `RetryPolicy` is declared in the wire contract but read by no code
 

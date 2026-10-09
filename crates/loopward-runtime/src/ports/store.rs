@@ -306,4 +306,17 @@ pub trait LoopStore: Send + Sync {
     /// Renews an already-held lease, extending its expiry without changing
     /// its fencing token.
     async fn renew_lease(&self, lease: &LoopLease) -> Result<LoopLease, StoreError>;
+
+    /// Hands a held lease back before its TTL runs out, so any runtime
+    /// instance may acquire the Loop immediately rather than waiting for
+    /// expiry (§7; `docs/07-session-rotation.md` §12: "before releasing the
+    /// execution lease").
+    ///
+    /// Release ends the lease but never resets its fencing token: the next
+    /// acquisition, by any holder, still increments it, so `lease` can never
+    /// write again. A lease that is no longer current — already released,
+    /// expired, or superseded by a later acquisition — is left untouched,
+    /// and releasing it succeeds as a no-op: release can never cut short
+    /// another acquisition's lease.
+    async fn release_lease(&self, lease: &LoopLease) -> Result<(), StoreError>;
 }
